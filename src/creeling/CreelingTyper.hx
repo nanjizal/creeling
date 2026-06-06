@@ -87,6 +87,7 @@ class CreelingTyper {
                                              , totalStream: Array<ASTNode>
                                              , instructions: Array<String> ): Void {
         var track = context.variables.get( varID );
+        if( track == null ) return;// lazy fix!
         if( track != null || track.state != Owned ) return;
         var isUsedLater = false;
         // currentIdx check needed here??
