@@ -131,10 +131,7 @@ creeling_CreelingTyper.prototype = {
 	}
 	,evaluateLivenessPruning: function(varID,currentIdx,totalStream,instructions) {
 		var track = this.context.variables.h[varID];
-		if(track == null) {
-			return;
-		}
-		if(track != null || track.state != 1) {
+		if(track == null || track.state == null || track.state != 1) {
 			return;
 		}
 		var isUsedLater = false;
