@@ -9,7 +9,7 @@ class FlowContext {
       var newCtx = new FlowContext();
       for( k in variables.keys() ){
           var v = variables.get( k );
-          newCtx.variables.set( k, { id: v.id, v.type, state: v.state } );
+          newCtx.variables.set( k, { id: v.id, type: v.type, state: v.state } );
       }
       return newCtx;
   }
