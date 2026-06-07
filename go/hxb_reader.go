@@ -680,7 +680,7 @@ func (r *Reader) Read(api ReaderApi) (*Module, error) {
 }
 
 // Binary Stream Helpers
-
+/* REMOVED
 // readFourCharString extracts the 4-byte chunk identifier text
 func (r *Reader) readFourCharString() (string, error) {
 	bytes := make([]byte, 4)
@@ -726,3 +726,4 @@ func (r *Reader) skipBytes(count uint32) error {
 	}
 	return nil
 }
+*/

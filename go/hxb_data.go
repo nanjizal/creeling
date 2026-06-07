@@ -257,7 +257,7 @@ const (
 	OBD       ChunkKind = "OBD"
 
 	// Pre-registered extension token so hxbPlus works out of the box
-	CrLn_Chunk ChunkKind = "crLn"
+	CrLn_Chunk ChunkKind = "crL"
 )
 
 // A flat, fast registration lookup map
@@ -268,7 +268,7 @@ var validChunks = map[string]bool{
 	"TDD": true, "EOT": true, "EFR": true, "CFR": true,
 	"CFD": true, "EFD": true, "AFD": true, "OFD": true,
 	"EOF": true, "EXD": true, "EOM": true, "IMP": true,
-	"OBD": true, "crLn": true,
+	"OBD": true, "crL": true,
 }
 
 // ChunkKindFromString performs direct string casting validation
