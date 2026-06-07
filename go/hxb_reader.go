@@ -678,3 +678,51 @@ func (r *Reader) Read(api ReaderApi) (*Module, error) {
 	}
 	return r.module, nil
 }
+
+// Binary Stream Helpers
+
+// readFourCharString extracts the 4-byte chunk identifier text
+func (r *Reader) readFourCharString() (string, error) {
+	bytes := make([]byte, 4)
+	for i := 0; i < 4; i++ {
+		b, err := r.readByte() // Assuming r.readByte() handles your internal index ++
+		if err != nil {
+			return "", err
+		}
+		bytes[i] = b
+	}
+	return string(bytes), nil
+}
+
+// readUint32BE decodes 4 bytes into a Big-Endian unsigned integer
+func (r *Reader) readUint32BE() (uint32, error) {
+	b1, err := r.readByte()
+	if err != nil {
+		return 0, err
+	}
+	b2, err := r.readByte()
+	if err != nil {
+		return 0, err
+	}
+	b3, err := r.readByte()
+	if err != nil {
+		return 0, err
+	}
+	b4, err := r.readByte()
+	if err != nil {
+		return 0, err
+	}
+
+	return uint32(b1)<<24 | uint32(b2)<<16 | uint32(b3)<<8 | uint32(b4), nil
+}
+
+// skipBytes jumps your reader cursor forward over chunks we aren't handling
+func (r *Reader) skipBytes(count uint32) error {
+	for i := uint32(0); i < count; i++ {
+		_, err := r.readByte()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}

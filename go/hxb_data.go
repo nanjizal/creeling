@@ -255,64 +255,29 @@ const (
 	EOM       ChunkKind = "EOM"
 	IMP       ChunkKind = "IMP"
 	OBD       ChunkKind = "OBD"
+
+	// Pre-registered extension token so hxbPlus works out of the box
+	CrLn_Chunk ChunkKind = "crLn"
 )
 
-// ChunkKindFromString performs the identical switch logic found inside the OCaml / Haxe parsers
+// A flat, fast registration lookup map
+var validChunks = map[string]bool{
+	"STR": true, "DOC": true, "MDF": true, "MTF": true,
+	"CLR": true, "ENR": true, "ABR": true, "TDR": true,
+	"OFR": true, "CLD": true, "END": true, "ABD": true,
+	"TDD": true, "EOT": true, "EFR": true, "CFR": true,
+	"CFD": true, "EFD": true, "AFD": true, "OFD": true,
+	"EOF": true, "EXD": true, "EOM": true, "IMP": true,
+	"OBD": true, "crLn": true,
+}
+
+// ChunkKindFromString performs direct string casting validation
 func ChunkKindFromString(s string) (ChunkKind, error) {
-	fmt.Println(s) // Mirrors the native "trace(s)" debug statement
-	switch s {
-	case "STR":
-		return STR, nil
-	case "DOC":
-		return DOC, nil
-	case "MDF":
-		return MDF_Chunk, nil
-	case "MTF":
-		return MTF_Chunk, nil
-	case "CLR":
-		return CLR, nil
-	case "ENR":
-		return ENR, nil
-	case "ABR":
-		return ABR, nil
-	case "TDR":
-		return TDR, nil
-	case "OFR":
-		return OFR, nil
-	case "CLD":
-		return CLD, nil
-	case "END":
-		return END, nil
-	case "ABD":
-		return ABD, nil
-	case "TDD":
-		return TDD, nil
-	case "EOT":
-		return EOT, nil
-	case "EFR":
-		return EFR, nil
-	case "CFR":
-		return CFR, nil
-	case "CFD":
-		return CFD, nil
-	case "EFD":
-		return EFD, nil
-	case "AFD":
-		return AFD, nil
-	case "EOF":
-		return EOF, nil
-	case "EXD":
-		return EXD, nil
-	case "EOM":
-		return EOM, nil
-	case "OFD":
-		return OFD, nil
-	case "IMP":
-		return IMP, nil
-	case "OBD":
-		return OBD, nil
-	default:
-		// Emits exact matching error syntax string array layout
+	fmt.Println(s) // Native Haxe "trace(s)" debug statement
+
+	if !validChunks[s] {
 		return "", fmt.Errorf("%w: Unknown chunk kind: |%s|", ErrHxbReaderException, s)
 	}
+
+	return ChunkKind(s), nil
 }
