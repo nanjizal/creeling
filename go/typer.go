@@ -1,5 +1,9 @@
 package main
 
+import (
+	"strconv"
+)
+
 type State int
 
 const (
@@ -53,9 +57,13 @@ func (t *Typer) ProcessNode(node Node, ctx *Context) {
 	case NodeCall:
 		track, exists := ctx.Variables[node.VarID]
 		argState := Borrow
+
 		if exists && track.State == Owned {
 			argState = Owned
+			track.State = Borrow
+			ctx.Variables[node.VarID] = track
 		}
+
 		stateStr := "Borrow"
 		if argState == Owned {
 			stateStr = "Owned"
@@ -66,7 +74,7 @@ func (t *Typer) ProcessNode(node Node, ctx *Context) {
 		if track, exists := ctx.Variables[node.VarID]; exists {
 			track.State = Leaked
 			ctx.Variables[node.VarID] = track
-			t.Instructions = append(t.Instructions, "UPGRADE_TO_RUNTIME_RC_var"+string(rune(node.VarID)))
+			t.Instructions = append(t.Instructions, "UPGRADE_TO_RUNTIME_RC_var"+strconv.Itoa(node.VarID))
 		}
 
 	case NodeVarDecl:
@@ -74,7 +82,7 @@ func (t *Typer) ProcessNode(node Node, ctx *Context) {
 			ID:    node.VarID,
 			State: Owned,
 		}
-		t.Instructions = append(t.Instructions, "ALLOC_VAR var_"+string(rune(node.VarID)))
+		t.Instructions = append(t.Instructions, "ALLOC_VAR var_"+strconv.Itoa(node.VarID))
 	case NodeIfElse:
 		thenContext := ctx.Clone()
 		elseContext := ctx.Clone()
@@ -84,8 +92,6 @@ func (t *Typer) ProcessNode(node Node, ctx *Context) {
 		for _, childNode := range node.ElseBlock {
 			t.ProcessNode(childNode, elseContext)
 		}
-		//t.ProcessBlock(node.ThenBlock, thenContext)
-		//t.ProcessBlock(node.ElseBlock, elseContext)
 		ctx.Variables = t.MergeBranchUnification(thenContext, elseContext).Variables
 	case NodeBlock:
 		for _, childNode := range node.Nodes {
@@ -103,26 +109,31 @@ func (ctx *Context) Clone() *Context {
 	}
 	return cloned
 }
+
 func (t *Typer) ProcessBlock(stream []Node, ctx *Context) {
 	for idx, node := range stream {
 		t.ProcessNode(node, ctx)
+
 		targetVarID := node.VarID
 		if node.Kind == NodeIfElse {
 			targetVarID = t.findVariableInBranch(node)
 		}
 
 		if targetVarID != 0 {
-			isUsedLater := t.evaluateLivenessPruning(idx, node.VarID, stream)
+			// FIX 1: Pass targetVarID here instead of node.VarID!
+			isUsedLater := t.evaluateLivenessPruning(idx, targetVarID, stream)
+
 			if !isUsedLater {
-				if _, exists := ctx.Variables[node.VarID]; exists {
-					t.Instructions = append(t.Instructions, "LFR3_FREE var_"+string(rune(node.VarID)))
+				// FIX 2: Check and remove using targetVarID as well
+				if _, exists := ctx.Variables[targetVarID]; exists {
+					t.Instructions = append(t.Instructions, "LFR3_FREE var_"+strconv.Itoa(targetVarID))
 					delete(ctx.Variables, targetVarID)
 				}
 			}
 		}
 	}
-
 }
+
 func (t *Typer) findVariableInBranch(node Node) int {
 	for _, child := range node.ThenBlock {
 		if child.VarID != 0 {
@@ -167,9 +178,6 @@ func (t *Typer) MergeBranchUnification(thenCtx *Context, elseCtx *Context) *Cont
 }
 func (t *Typer) evaluateLivenessPruning(currentIdx int, varID int, stream []Node) bool {
 	for i := currentIdx + 1; i < len(stream); i++ {
-		/*if stream[i].VarID == varID {
-			return true
-		}*/
 		if t.nodeUsesVariable(stream[i], varID) {
 			return true
 		}
