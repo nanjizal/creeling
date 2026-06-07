@@ -1,0 +1,2 @@
+-cmd cd go
+-cmd go run main.go typer.go
