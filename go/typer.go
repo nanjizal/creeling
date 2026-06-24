@@ -10,20 +10,11 @@ const (
 	Owned State = iota
 	Borrow
 	Leaked
-)
-
-type NodeType int
-
-const (
-	NodeCall NodeType = iota
-	NodeFieldStore
-	NodeVarDecl
-	NodeIfElse
-	NodeBlock
+	Free
 )
 
 type Node struct {
-	Kind      NodeType
+	Kind      FullOpcode
 	VarID     int
 	MethodID  string
 	Field     string
@@ -54,7 +45,7 @@ func NewTyper() *Typer {
 // Flow analysis
 func (t *Typer) ProcessNode(node Node, ctx *Context) {
 	switch node.Kind {
-	case NodeCall:
+	case ECall:
 		track, exists := ctx.Variables[node.VarID]
 		argState := Borrow
 
@@ -70,20 +61,34 @@ func (t *Typer) ProcessNode(node Node, ctx *Context) {
 		}
 		t.Instructions = append(t.Instructions, "CALL_METHOD"+"_Variant_"+stateStr)
 
-	case NodeFieldStore:
+	case EField:
 		if track, exists := ctx.Variables[node.VarID]; exists {
 			track.State = Leaked
 			ctx.Variables[node.VarID] = track
 			t.Instructions = append(t.Instructions, "UPGRADE_TO_RUNTIME_RC_var"+strconv.Itoa(node.VarID))
 		}
-
-	case NodeVarDecl:
-		ctx.Variables[node.VarID] = VariableTrack{
-			ID:    node.VarID,
-			State: Owned,
+	case EBlock:
+		for _, childNode := range node.Nodes {
+			if childNode.VarID != 0 {
+				if _, active := ctx.Variables[childNode.VarID]; !active {
+					ctx.Variables[childNode.VarID] = VariableTrack{
+						ID:    childNode.VarID,
+						State: Owned,
+					}
+					t.Instructions = append(t.Instructions, "ALLOC_VAR var_"+strconv.Itoa(childNode.VarID))
+				}
+			}
+			t.ProcessNode(childNode, ctx)
 		}
-		t.Instructions = append(t.Instructions, "ALLOC_VAR var_"+strconv.Itoa(node.VarID))
-	case NodeIfElse:
+		/*
+			case NodeVarDecl:
+				ctx.Variables[node.VarID] = VariableTrack{
+					ID:    node.VarID,
+					State: Owned,
+				}
+				t.Instructions = append(t.Instructions, "ALLOC_VAR var_"+strconv.Itoa(node.VarID))
+		*/
+	case EIf:
 		thenContext := ctx.Clone()
 		elseContext := ctx.Clone()
 		for _, childNode := range node.ThenBlock {
@@ -93,10 +98,6 @@ func (t *Typer) ProcessNode(node Node, ctx *Context) {
 			t.ProcessNode(childNode, elseContext)
 		}
 		ctx.Variables = t.MergeBranchUnification(thenContext, elseContext).Variables
-	case NodeBlock:
-		for _, childNode := range node.Nodes {
-			t.ProcessNode(childNode, ctx)
-		}
 	}
 }
 
@@ -115,7 +116,7 @@ func (t *Typer) ProcessBlock(stream []Node, ctx *Context) {
 		t.ProcessNode(node, ctx)
 
 		targetVarID := node.VarID
-		if node.Kind == NodeIfElse {
+		if node.Kind == EIf {
 			targetVarID = t.findVariableInBranch(node)
 		}
 

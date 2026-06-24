@@ -39,16 +39,23 @@ type ReaderApi interface {
 	AddModule(module *Module)
 }
 
+// LinearityKey binds a specific expression point to a target variable index
+type LinearityKey struct {
+	ExprOffset int
+	VarID      int
+}
+
 type Reader struct {
-	i          io.Reader
-	api        ReaderApi
-	stringPool []string
-	classes    []Class
-	enums      []Enum
-	typedefs   []Typedef
-	abstracts  []Abstract
-	anonFields []ClassField
-	module     *Module
+	i            io.Reader
+	api          ReaderApi
+	stringPool   []string
+	classes      []Class
+	enums        []Enum
+	typedefs     []Typedef
+	abstracts    []Abstract
+	anonFields   []ClassField
+	module       *Module
+	linearityMap map[LinearityKey]State
 }
 
 func NewReader(i io.Reader) *Reader {
@@ -586,6 +593,260 @@ func (r *Reader) readOFR() error {
 	return nil
 }
 
+// In hxb_reader.go
+
+func (r *Reader) readEFD() error {
+	// 1. Joey's format declares how many master expression entries are in this block
+	exprCount, err := r.readUleb128()
+	if err != nil {
+		return err
+	}
+
+	// 2. Consume them in order, advancing the file cursor precisely
+	for i := 0; i < exprCount; i++ {
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readAFD handles the second expression block for Anonymous Closures
+func (r *Reader) readAFD() error {
+	anonCount, err := r.readUleb128()
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < anonCount; i++ {
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (r *Reader) readExpression() error {
+	opByte, err := r.readByte()
+	if err != nil {
+		return err
+	}
+	op := FullOpcode(opByte)
+
+	if op == Eof {
+		return nil
+	}
+
+	// Increment your Creeling flow counter on active tokens
+	//r.currentExprOffset++
+
+	switch op {
+	case EConst, ELocal, EType:
+		// Format: [Opcode] + [PoolIndex: Uleb128]
+		_, _ = r.readUleb128()
+
+	case EArray, EIn, EBinop:
+		// Binop format: [Opcode] + [BinopType: Byte] + [Left: Expr] + [Right: Expr]
+		if op == EBinop {
+			_, _ = r.readByte()
+		}
+		if err := r.readExpression(); err != nil {
+			return err
+		} // Left
+		if err := r.readExpression(); err != nil {
+			return err
+		} // Right
+
+	case EField, ECheckType, EMeta:
+		// Format: [Opcode] + [Target: Expr] + [PoolIndex: Uleb128]
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+		_, _ = r.readUleb128()
+
+	case EParenthesis, EUntyped, EThrow:
+		// Format: [Opcode] + [Inner: Expr]
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+
+	case EObjectDecl:
+		// Format: [Opcode] + [Count: Uleb128] + N * ([FieldNameIndex: Uleb128] + [Value: Expr])
+		count, _ := r.readUleb128()
+		for i := 0; i < int(count); i++ {
+			_, _ = r.readUleb128()
+			if err := r.readExpression(); err != nil {
+				return err
+			}
+		}
+
+	case EArrayDecl, EBlock:
+		// Format: [Opcode] + [Count: Uleb128] + N * [Item: Expr]
+		count, _ := r.readUleb128()
+		for i := 0; i < int(count); i++ {
+			if err := r.readExpression(); err != nil {
+				return err
+			}
+		}
+
+	case ECall, ENew:
+		// ECall format: [Opcode] + [Target: Expr] + [ArgCount: Uleb128] + N * [Arg: Expr]
+		// ENew format:  [Opcode] + [ClassIdx: Uleb128] + [ArgCount: Uleb128] + N * [Arg: Expr]
+		if op == ECall {
+			if err := r.readExpression(); err != nil {
+				return err
+			}
+		} else {
+			_, _ = r.readUleb128() // ClassIdx
+		}
+		argCount, _ := r.readUleb128()
+		for i := 0; i < int(argCount); i++ {
+			if err := r.readExpression(); err != nil {
+				return err
+			}
+		}
+
+	case EUnop:
+		// Format: [Opcode] + [OpType: Byte] + [IsPostfix: Byte] + [Target: Expr]
+		_, _ = r.readByte()
+		_, _ = r.readByte()
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+
+	case EFunction:
+		// Format: [Opcode] + [NameIdx: Uleb128] + [FuncSignature details...]
+		_, _ = r.readUleb128()
+		// (Assuming a basic delegate jump or custom function block skip is handled here)
+
+	case EFor:
+		// Format: [Opcode] + [LoopVarIdx: Uleb128] + [Iter: Expr] + [Body: Expr]
+		_, _ = r.readUleb128()
+		if err := r.readExpression(); err != nil {
+			return err
+		} // Iterator
+		if err := r.readExpression(); err != nil {
+			return err
+		} // Loop Body
+
+	case EIf:
+		// Format: [Opcode] + [Cond: Expr] + [Then: Expr] + [HasElse: Byte] + [OptionalElse: Expr]
+		if err := r.readExpression(); err != nil {
+			return err
+		} // Condition
+		if err := r.readExpression(); err != nil {
+			return err
+		} // Then
+		hasElse, _ := r.readByte()
+		if hasElse == 1 {
+			if err := r.readExpression(); err != nil {
+				return err
+			} // Else
+		}
+
+	case EWhile:
+		// Format: [Opcode] + [Cond: Expr] + [Body: Expr] + [IsDoWhile: Byte]
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+		_, _ = r.readByte()
+
+	case EReturn:
+		// Format: [Opcode] + [HasValue: Byte] + [OptionalValue: Expr]
+		hasValue, _ := r.readByte()
+		if hasValue == 1 {
+			if err := r.readExpression(); err != nil {
+				return err
+			}
+		}
+
+	case ECast:
+		// Format: [Opcode] + [Target: Expr] + [HasType: Byte] + [OptionalType: Uleb128]
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+		hasType, _ := r.readByte()
+		if hasType == 1 {
+			_, _ = r.readUleb128()
+		}
+
+	case ETernary:
+		// Format: [Opcode] + [Cond: Expr] + [Then: Expr] + [Else: Expr]
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+		if err := r.readExpression(); err != nil {
+			return err
+		}
+
+	case EBreak, EContinue:
+		// Leaf nodes: Exit immediately
+		return nil
+
+	default:
+		// Fall-through catch-all for complex nested structures (ESwitch, ETry, EDisplay)
+		// These carry highly specialized embedded tables we can flesh out as needed.
+	}
+
+	return nil
+}
+
+func (r *Reader) readcrL() error {
+	// Parse your custom linearity instructions
+	actionCount, err := r.readUleb128()
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < actionCount; i++ {
+		exprOffset, _ := r.readUleb128()
+		varID, _ := r.readUleb128()
+		actionByte, _ := r.readByte()
+
+		// Stream directly into your flat Typer state map
+		r.applyLinearityState(exprOffset, varID, actionByte)
+	}
+
+	return nil
+}
+
+// applyLinearityState intercepts and records memory lifecycle instructions using your real Typer states
+func (r *Reader) applyLinearityState(exprOffset int, varID int, actionByte byte) {
+	if r.linearityMap == nil {
+		r.linearityMap = make(map[LinearityKey]State)
+	}
+
+	// Cast the incoming byte straight into your existing Typer State type
+	targetState := State(actionByte)
+	key := LinearityKey{ExprOffset: exprOffset, VarID: varID}
+
+	// Cache it in the flat matrix
+	r.linearityMap[key] = targetState
+
+	// Trace feedback using your real enum constants
+	var stateName string
+	switch targetState {
+	case Owned:
+		stateName = "OWNED"
+	case Borrow:
+		stateName = "BORROW"
+	case Leaked:
+		stateName = "LEAKED"
+	case Free:
+		stateName = "FREE (LFR3)"
+	default:
+		stateName = fmt.Sprintf("UNKNOWN_STATE_BYTE_(0x%X)", actionByte)
+	}
+
+	fmt.Printf("[Creeling Trace] Registered %s directive for Var %d at Expression Offset %d\n",
+		stateName, varID, exprOffset)
+}
+
 func (r *Reader) readChunkData(kind ChunkKind, size int) error {
 	switch kind {
 	case STR:
@@ -620,6 +881,13 @@ func (r *Reader) readChunkData(kind ChunkKind, size int) error {
 		// Boundary reached
 	case CFD:
 		return r.readCFD()
+	case EFD:
+		return r.readEFD()
+	case AFD:
+		return r.readAFD()
+	case crL:
+		// custom creeling chunk
+		return r.readcrL()
 	default:
 		if size > 0 {
 			discardBuf := make([]byte, size)

@@ -33,6 +33,42 @@ import (
 	"fmt"
 )
 
+type FullOpcode byte
+
+const (
+	Eof          FullOpcode = 0
+	EConst       FullOpcode = 1
+	ELocal       FullOpcode = 2
+	EArray       FullOpcode = 3
+	EBinop       FullOpcode = 4
+	EField       FullOpcode = 5
+	EType        FullOpcode = 6
+	EParenthesis FullOpcode = 7
+	EObjectDecl  FullOpcode = 8
+	EArrayDecl   FullOpcode = 9
+	ECall        FullOpcode = 10
+	ENew         FullOpcode = 11
+	EUnop        FullOpcode = 12
+	EFunction    FullOpcode = 13
+	EBlock       FullOpcode = 14
+	EFor         FullOpcode = 15
+	EIn          FullOpcode = 16
+	EIf          FullOpcode = 17
+	EWhile       FullOpcode = 18
+	ESwitch      FullOpcode = 19
+	ETry         FullOpcode = 20
+	EReturn      FullOpcode = 21
+	EBreak       FullOpcode = 22
+	EContinue    FullOpcode = 23
+	EUntyped     FullOpcode = 24
+	EThrow       FullOpcode = 25
+	ECast        FullOpcode = 26
+	EDisplay     FullOpcode = 27
+	ETernary     FullOpcode = 28
+	ECheckType   FullOpcode = 29
+	EMeta        FullOpcode = 30
+)
+
 // HxbReaderException maps directly to the custom Haxe Exception definition
 var ErrHxbReaderException = errors.New("HxbReaderException")
 
@@ -255,10 +291,8 @@ const (
 	EOM       ChunkKind = "EOM"
 	IMP       ChunkKind = "IMP"
 	OBD       ChunkKind = "OBD"
-
-	// Pre-registered extension token so hxbPlus works out of the box
-	CrLn_Chunk ChunkKind = "crL"
-)
+	crL       ChunkKind = "crL"
+) // Pre-registered extension token so hxbPlus works out of the box
 
 // A flat, fast registration lookup map
 var validChunks = map[string]bool{
