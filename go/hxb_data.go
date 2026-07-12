@@ -305,6 +305,7 @@ const (
 	DOC       ChunkKind = "DOC"
 	MDF_Chunk ChunkKind = "MDF"
 	MTF_Chunk ChunkKind = "MTF"
+	MDR       ChunkKind = "MDR"
 	CLR       ChunkKind = "CLR"
 	ENR       ChunkKind = "ENR"
 	ABR       ChunkKind = "ABR"
@@ -332,6 +333,7 @@ const (
 // A flat, fast registration lookup map
 var validChunks = map[string]bool{
 	"STR": true, "DOC": true, "MDF": true, "MTF": true,
+	"MDR": true, // Added explicitly to match your hex canvas layout at 0x000000C2
 	"CLR": true, "ENR": true, "ABR": true, "TDR": true,
 	"OFR": true, "CLD": true, "END": true, "ABD": true,
 	"TDD": true, "EOT": true, "EFR": true, "CFR": true,

@@ -4,18 +4,6 @@ import (
 	"strconv"
 )
 
-/*
-type State int
-
-const (
-
-	Owned State = iota
-	Borrow
-	Leaked
-	Free
-
-)
-*/
 type Node struct {
 	Kind      FullOpcode
 	VarID     int
