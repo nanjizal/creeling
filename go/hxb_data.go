@@ -33,6 +33,41 @@ import (
 	"fmt"
 )
 
+// Flow states track lifespan behavior over time
+type State int
+
+const (
+	Owned  State = 0
+	Borrow State = 1
+	Leaked State = 2
+	Free   State = 3
+)
+
+// Hardware Memory State targets (Space definitions)
+const (
+	Managed       byte = 0x00 // Standard target GC heap
+	Stack         byte = 0x01 // CPU Local frame allocation
+	UnmanagedHeap byte = 0x02 // Manual malloc/free allocations
+	Inlined       byte = 0x03 // Flattened directly inside parent container
+)
+
+// Track unifies behavior (Flow), hardware target (Place), type, and offset layout constraints.
+// Update your existing Track struct to match this:
+type Track struct {
+	ID    int    `json:"id"`
+	Flow  State  `json:"flow"`  // lifecycle state
+	Place byte   `json:"place"` // hardware location (Managed, Stack, etc.)
+	Type  string `json:"type"`  // target language data type string
+	Off   int32  `json:"off"`   // byte layout displacement offset size
+}
+
+// Tag stores absolute file positioning indices for the injector pass
+type Tag struct {
+	Pos   int   // absolute file byte index
+	Place byte  // hardware target state
+	Off   int32 // structure layout calculation offset
+}
+
 type FullOpcode byte
 
 const (
