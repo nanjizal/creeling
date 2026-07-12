@@ -1,0 +1,23 @@
+# --- Step 1: Rapid Runtime Baseline Verification ---
+-cp baseTest/src
+-main Main
+--interp
+
+--next
+
+# --- Step 2: Generate Production HXB (No Traces / Clean Bytecode) ---
+-cp baseTest/src
+-main Main
+--no-traces
+-D hxb-dump
+--hxb baseTest/hello-hxb.zip
+
+--next
+-cmd unzip -o baseTest/hello-hxb.zip -d baseTest/
+
+--next
+# --- Step 3: Run the Go Pipeline and Disassemble hxbPlus ---
+# Navigates to your go package folder, executes your exact structural files, 
+# and processes the Main.hxb directly into readable structural JSON.
+-cmd cd go
+-cmd go run *.go

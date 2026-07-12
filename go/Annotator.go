@@ -5,27 +5,21 @@ import (
 	"encoding/binary"
 )
 
-// HxbStructureParser acts exactly like a Haxe interface extending ReaderApi:
-// `interface HxbStructureParser extends ReaderApi {}`
-// This inherits all required parsing methods statically without manually re-typing them.
+// HxbStructureParser represents your downstream structural target interface contract.
 type HxbStructureParser interface {
 	ReaderApi
-	// If the Annotator pass requires extra bespoke callback hooks in the future,
-	// they can be declared right here.
 }
 
-// Annotator uses clean, explicit composition by reference rather than anonymous embedding.
-// This structure maps directly to properties on a Haxe class or fields in an OCaml record structure.
+// Annotator handles the dual-pass compilation pass by passing structured Nodes
 type Annotator struct {
-	ReaderObj *Reader       // Explicit link to your hxb_reader.go parsing engine
-	TyperObj  *Typer        // Explicit link to your typer.go type flow analyzer
-	Buf       []byte        // Raw immutable source file byte container input stream
-	Pos       int           // Tracking index counter mapping absolute position
-	Tags      []Tag         // Metadata splicing marker collection array
-	Vars      map[int]Track // Unified compiler symbol table index lookup mapping
+	ReaderObj *Reader       // Reference to your reader.go architecture
+	TyperObj  *Typer        // Reference to your typer.go analyzer
+	Buf       []byte        // Raw input binary file stream buffer
+	Pos       int           // Dynamic byte position tracker
+	Tags      []Tag         // Pass 2 injection locations coordinates array
+	Vars      map[int]Track // Core unified structural symbol table mapping
 }
 
-// NewAnnotator creates a fully static, explicitly referenced pipeline constructor.
 func NewAnnotator(b []byte, r *Reader, t *Typer) *Annotator {
 	return &Annotator{
 		ReaderObj: r,
@@ -35,47 +29,53 @@ func NewAnnotator(b []byte, r *Reader, t *Typer) *Annotator {
 	}
 }
 
-// ReadB overrides low-level stream scanning to keep the physical file Pos synced.
-func (a *Annotator) ReadB() (byte, error) {
-	// Call the reader method explicitly through the reference variable
-	b, err := a.ReaderObj.readByte()
-	if err == nil {
-		a.Pos++ // Advances physical index location during the file scan pass
-	}
-	return b, err
-}
-
-// Pass 1: Scan standard HXB data via the base reader and map out unmanaged layout definitions.
+// Pass 1: Parse the binary stream into a Module Node tree, then pass it to the Typer
 func (a *Annotator) Pass1(targetApi HxbStructureParser) (*Module, error) {
-	// targetApi now matches the ReaderApi interface type requirements perfectly
+	a.Pos = 0
+	a.Tags = nil
+	a.Vars = make(map[int]Track)
+
+	// Step A: Let reader.go execute completely untouched.
+	// It parses the binary layout stream and returns a fully realized Node tree (*Module)
 	m, err := a.ReaderObj.Read(targetApi)
 	if err != nil {
 		return nil, err
 	}
 
-	// Simulation: Your liveness pruning code isolates an allocation (VarID 7).
-	// It notes that it can safely live on the CPU Stack frame with a -32 byte constraint layout.
+	// Step B: Direct Node evaluation! Pass the Module tree nodes straight to the Typer.
+	// The Typer traverses the node scopes, tracks variable lifetimes, and calculates layouts.
+	// a.TyperObj.AnalyzeModuleTree(m, a)
+
+	// Simulation target check: If the Typer analysis run identifies an optimal allocation allocation:
 	vID := 7
+	targetPlace := Stack
+	layoutOffset := int32(-16)
+
 	a.Vars[vID] = Track{
 		ID:    vID,
 		Flow:  Owned,
-		Place: Stack,
+		Place: targetPlace,
 		Type:  "Int",
-		Off:   -32,
+		Off:   layoutOffset,
 	}
 
-	// Register the tag offset. We mock an injection position at byte 10.
-	a.Tags = append(a.Tags, Tag{Pos: 10, Place: Stack, Off: -32})
+	// Capture the dynamic position using byte markers saved inside the parsed chunks!
+	// If your chunk objects contain file offsets, you read them directly from the Node tree.
+	a.Tags = append(a.Tags, Tag{
+		Pos:   12, // e.g., m.Chunks[0].FilePosition
+		Place: targetPlace,
+		Off:   layoutOffset,
+	})
 
 	return m, nil
 }
 
-// Pass 2: Stream valid HXB data out and append hidden crL chunk elements inline.
+// Pass 2: Stream out raw payload blocks and splice in hidden crL metadata chunks
 func (a *Annotator) Pass2() []byte {
 	var out bytes.Buffer
 	n := len(a.Buf)
 
-	// Step A: Find the final EOM (End of Module) marker boundary in the original buffer.
+	// Find the final EOM (End of Module) marker boundary inside your buffer
 	eomPos := n
 	for i := n - 3; i >= 0; i-- {
 		if string(a.Buf[i:i+3]) == "EOM" {
@@ -84,39 +84,31 @@ func (a *Annotator) Pass2() []byte {
 		}
 	}
 
-	// Stream out the original valid standard HXB payload chunks untouched
+	// Stream original standard HXB payload chunks untouched
 	out.Write(a.Buf[:eomPos])
 
-	// Step B: Serialize custom tags into a temporary payload buffer to auto-calculate the chunk width.
+	// Serialize custom tags into a temporary payload buffer
 	var crlBuf bytes.Buffer
 	if len(a.Tags) > 0 {
-		// Write out the amount of injections being registered in this module file
 		crlBuf.WriteByte(byte(len(a.Tags)))
 
 		for _, t := range a.Tags {
 			crlBuf.WriteByte(byte(t.Pos))
 			crlBuf.WriteByte(t.Place)
 
-			// Simple, portable bit-shifting masking for the Int32 offset configuration.
-			// This arithmetic maps 1:1 into Haxe and OCaml seamlessly.
+			// Direct byte shifts are universal across Go, Haxe, and OCaml
 			crlBuf.WriteByte(byte(t.Off & 0xFF))
 			crlBuf.WriteByte(byte((t.Off >> 8) & 0xFF))
 			crlBuf.WriteByte(byte((t.Off >> 16) & 0xFF))
 			crlBuf.WriteByte(byte((t.Off >> 24) & 0xFF))
 		}
 
-		// Step C: Inject the pre-registered 3-character hidden "crL" chunk identifier header
 		out.Write([]byte("crL"))
-
-		// Write chunk payload data size width as Big-Endian Int32 to match standard chunk formats
 		chunkSize := int32(crlBuf.Len())
 		binary.Write(&out, binary.BigEndian, chunkSize)
-
-		// Dump the actual payload body contents
 		out.Write(crlBuf.Bytes())
 	}
 
-	// Step D: Write out the final EOM trailing block sequence to terminate the file smoothly
 	out.Write([]byte("EOM"))
 	binary.Write(&out, binary.BigEndian, int32(0))
 
