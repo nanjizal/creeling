@@ -10,17 +10,6 @@ type HxbStructureParser interface {
 	ReaderApi
 }
 
-/*
-// Annotator coordinates the dual-pass pipeline using explicit composition referencing.
-type Annotator struct {
-	ReaderObj *Reader // Explicit link to your hxb_reader.go parsing engine
-	TyperObj  *Typer  // Explicit link to your typer.go analyzer
-	Buf       []byte  // Raw input binary file stream buffer
-	Pos       int     // Dynamic byte position tracker managed by the fixed-window scanner
-	Tags      []Tag   // The minimal, non-redundant metadata splicing marker collection array
-}
-*/
-
 // Annotator uses Anonymous Embedding to "extend" the base Reader class.
 type Annotator struct {
 	*Reader         // 🎯 ANONYMOUS EMBEDDING: Annotator now inherits ALL methods of Reader!
