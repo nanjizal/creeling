@@ -52,7 +52,6 @@ const (
 )
 
 // Track unifies behavior (Flow), hardware target (Place), type, and offset layout constraints.
-// Update your existing Track struct to match this:
 type Track struct {
 	ID    int    `json:"id"`
 	Flow  State  `json:"flow"`  // lifecycle state
@@ -61,11 +60,19 @@ type Track struct {
 	Off   int32  `json:"off"`   // byte layout displacement offset size
 }
 
-// Tag stores absolute file positioning indices for the injector pass
+// Tag stores the resolved (position, varID, state) triple that Pass2 writes
+// into the crL chunk. Pos is the expression/declaration byte offset carried
+// through from Node.Offset via VariableTrack.Offset, VarID identifies the
+// variable, and Place carries the byte value readcrL/applyLinearityState
+// reads back as a State (Owned/Borrow/Leaked/Free).
+//
+// EDIT: added VarID — the original Tag had no way to carry the variable id
+// that readcrL's wire format requires (exprOffset, varID, actionByte).
 type Tag struct {
-	Pos   int   // absolute file byte index
-	Place byte  // hardware target state
-	Off   int32 // structure layout calculation offset
+	Pos   int   // absolute file byte index / expression offset
+	VarID int   // target variable id
+	Place byte  // byte written into the crL chunk (interpreted as flow State on read-back)
+	Off   int32 // reserved for a future hardware-layout pass; not yet written to crL
 }
 
 type FullOpcode byte

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 )
 
 // HxbStructureParser represents your downstream structural target interface contract.
@@ -12,7 +13,7 @@ type HxbStructureParser interface {
 
 // Annotator uses Anonymous Embedding to "extend" the base Reader class.
 type Annotator struct {
-	*Reader         // 🎯 ANONYMOUS EMBEDDING: Annotator now inherits ALL methods of Reader!
+	*Reader         // ANONYMOUS EMBEDDING: Annotator inherits ALL methods of Reader!
 	TyperObj *Typer // Explicit reference link to your typer.go analyzer
 	Buf      []byte // Raw input binary file stream buffer
 	Pos      int    // Dynamic byte position tracker managed by the fixed-window scanner
@@ -29,324 +30,427 @@ func NewAnnotator(b []byte, r *Reader, t *Typer) *Annotator {
 	}
 }
 
-func (r *Reader) readExpression() error {
+// readExpression decodes one expression from the EXD/EFD/AFD stream and
+// builds the real Node tree the Typer consumes (VarID, Nodes, ThenBlock,
+// ElseBlock, and now Offset). This is a *Reader method physically defined
+// here in Annotator.go — Go allows splitting a type's methods across files
+// in the same package, so this needs no back-pointer/interface seam to
+// reach Reader's primitives (readByte/readUleb128/currentExprOffset/etc).
+//
+// EDIT: previously this only advanced the byte cursor and discarded
+// everything (a pure "skip parser") — every read call below is in the
+// exact same order as that version, this is additive only, not a format
+// change.
+func (r *Reader) readExpression() (Node, error) {
+	offset := r.currentExprOffset
+	r.currentExprOffset++
+
 	opByte, err := r.readByte()
 	if err != nil {
-		return err
+		return Node{}, err
 	}
 	op := FullOpcode(opByte)
+	node := Node{Kind: op, Offset: offset}
 
 	if op == Eof {
-		return nil
+		return node, nil
 	}
 
-	// Increment your Creeling flow counter on active tokens
-	//r.currentExprOffset++
-
 	switch op {
-	case EConst, ELocal, EType:
+	case EConst, EType:
 		// Format: [Opcode] + [PoolIndex: Uleb128]
-		_, _ = r.readUleb128()
+		_, err = r.readUleb128()
+		return node, err
+
+	case ELocal:
+		// Format: [Opcode] + [PoolIndex: Uleb128] — the pool index doubles as VarID here
+		idx, err := r.readUleb128()
+		if err != nil {
+			return node, err
+		}
+		node.VarID = idx
+		return node, nil
 
 	case EArray, EIn, EBinop:
 		// Binop format: [Opcode] + [BinopType: Byte] + [Left: Expr] + [Right: Expr]
 		if op == EBinop {
-			_, _ = r.readByte()
+			if _, err := r.readByte(); err != nil {
+				return node, err
+			}
 		}
-		if err := r.readExpression(); err != nil {
-			return err
-		} // Left
-		if err := r.readExpression(); err != nil {
-			return err
-		} // Right
+		left, err := r.readExpression()
+		if err != nil {
+			return node, err
+		}
+		right, err := r.readExpression()
+		if err != nil {
+			return node, err
+		}
+		node.Nodes = []Node{left, right}
+		if left.VarID != 0 {
+			node.VarID = left.VarID
+		}
+		return node, nil
 
 	case EField, ECheckType, EMeta:
 		// Format: [Opcode] + [Target: Expr] + [PoolIndex: Uleb128]
-		if err := r.readExpression(); err != nil {
-			return err
+		target, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
-		_, _ = r.readUleb128()
+		if _, err := r.readUleb128(); err != nil {
+			return node, err
+		}
+		node.Nodes = []Node{target}
+		node.VarID = target.VarID
+		return node, nil
 
 	case EParenthesis, EUntyped, EThrow:
 		// Format: [Opcode] + [Inner: Expr]
-		if err := r.readExpression(); err != nil {
-			return err
+		inner, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
+		node.Nodes = []Node{inner}
+		node.VarID = inner.VarID
+		return node, nil
 
 	case EObjectDecl:
 		// Format: [Opcode] + [Count: Uleb128] + N * ([FieldNameIndex: Uleb128] + [Value: Expr])
-		count, _ := r.readUleb128()
-		for i := 0; i < int(count); i++ {
-			_, _ = r.readUleb128()
-			if err := r.readExpression(); err != nil {
-				return err
-			}
+		count, err := r.readUleb128()
+		if err != nil {
+			return node, err
 		}
+		for i := 0; i < count; i++ {
+			if _, err := r.readUleb128(); err != nil {
+				return node, err
+			}
+			val, err := r.readExpression()
+			if err != nil {
+				return node, err
+			}
+			node.Nodes = append(node.Nodes, val)
+		}
+		return node, nil
 
 	case EArrayDecl, EBlock:
 		// Format: [Opcode] + [Count: Uleb128] + N * [Item: Expr]
-		count, _ := r.readUleb128()
-		for i := 0; i < int(count); i++ {
-			if err := r.readExpression(); err != nil {
-				return err
-			}
+		count, err := r.readUleb128()
+		if err != nil {
+			return node, err
 		}
+		for i := 0; i < count; i++ {
+			child, err := r.readExpression()
+			if err != nil {
+				return node, err
+			}
+			node.Nodes = append(node.Nodes, child)
+		}
+		return node, nil
 
 	case ECall, ENew:
 		// ECall format: [Opcode] + [Target: Expr] + [ArgCount: Uleb128] + N * [Arg: Expr]
 		// ENew format:  [Opcode] + [ClassIdx: Uleb128] + [ArgCount: Uleb128] + N * [Arg: Expr]
+		var target Node
 		if op == ECall {
-			if err := r.readExpression(); err != nil {
-				return err
+			target, err = r.readExpression()
+			if err != nil {
+				return node, err
 			}
+			node.VarID = target.VarID
 		} else {
-			_, _ = r.readUleb128() // ClassIdx
-		}
-		argCount, _ := r.readUleb128()
-		for i := 0; i < int(argCount); i++ {
-			if err := r.readExpression(); err != nil {
-				return err
+			if _, err := r.readUleb128(); err != nil { // ClassIdx
+				return node, err
 			}
 		}
+		argCount, err := r.readUleb128()
+		if err != nil {
+			return node, err
+		}
+		args := make([]Node, 0, argCount)
+		for i := 0; i < argCount; i++ {
+			arg, err := r.readExpression()
+			if err != nil {
+				return node, err
+			}
+			args = append(args, arg)
+		}
+		if op == ECall {
+			node.Nodes = append([]Node{target}, args...)
+		} else {
+			node.Nodes = args
+		}
+		return node, nil
 
 	case EUnop:
 		// Format: [Opcode] + [OpType: Byte] + [IsPostfix: Byte] + [Target: Expr]
-		_, _ = r.readByte()
-		_, _ = r.readByte()
-		if err := r.readExpression(); err != nil {
-			return err
+		if _, err := r.readByte(); err != nil {
+			return node, err
 		}
+		if _, err := r.readByte(); err != nil {
+			return node, err
+		}
+		target, err := r.readExpression()
+		if err != nil {
+			return node, err
+		}
+		node.Nodes = []Node{target}
+		node.VarID = target.VarID
+		return node, nil
 
 	case EFunction:
 		// Format: [Opcode] + [NameIdx: Uleb128] + [FuncSignature details...]
-		_, _ = r.readUleb128()
-		// (Assuming a basic delegate jump or custom function block skip is handled here)
+		if _, err := r.readUleb128(); err != nil {
+			return node, err
+		}
+		return node, nil
 
 	case EFor:
 		// Format: [Opcode] + [LoopVarIdx: Uleb128] + [Iter: Expr] + [Body: Expr]
-		_, _ = r.readUleb128()
-		if err := r.readExpression(); err != nil {
-			return err
-		} // Iterator
-		if err := r.readExpression(); err != nil {
-			return err
-		} // Loop Body
+		if _, err := r.readUleb128(); err != nil {
+			return node, err
+		}
+		iter, err := r.readExpression()
+		if err != nil {
+			return node, err
+		}
+		body, err := r.readExpression()
+		if err != nil {
+			return node, err
+		}
+		node.Nodes = []Node{iter, body}
+		return node, nil
 
 	case EIf:
 		// Format: [Opcode] + [Cond: Expr] + [Then: Expr] + [HasElse: Byte] + [OptionalElse: Expr]
-		if err := r.readExpression(); err != nil {
-			return err
-		} // Condition
-		if err := r.readExpression(); err != nil {
-			return err
-		} // Then
-		hasElse, _ := r.readByte()
-		if hasElse == 1 {
-			if err := r.readExpression(); err != nil {
-				return err
-			} // Else
+		cond, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
+		thenExpr, err := r.readExpression()
+		if err != nil {
+			return node, err
+		}
+		node.Nodes = []Node{cond}
+		node.ThenBlock = []Node{thenExpr}
+		hasElse, err := r.readByte()
+		if err != nil {
+			return node, err
+		}
+		if hasElse == 1 {
+			elseExpr, err := r.readExpression()
+			if err != nil {
+				return node, err
+			}
+			node.ElseBlock = []Node{elseExpr}
+		}
+		return node, nil
 
 	case EWhile:
 		// Format: [Opcode] + [Cond: Expr] + [Body: Expr] + [IsDoWhile: Byte]
-		if err := r.readExpression(); err != nil {
-			return err
+		cond, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
-		if err := r.readExpression(); err != nil {
-			return err
+		body, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
-		_, _ = r.readByte()
+		if _, err := r.readByte(); err != nil {
+			return node, err
+		}
+		node.Nodes = []Node{cond, body}
+		return node, nil
 
 	case EReturn:
 		// Format: [Opcode] + [HasValue: Byte] + [OptionalValue: Expr]
-		hasValue, _ := r.readByte()
-		if hasValue == 1 {
-			if err := r.readExpression(); err != nil {
-				return err
-			}
+		hasValue, err := r.readByte()
+		if err != nil {
+			return node, err
 		}
+		if hasValue == 1 {
+			val, err := r.readExpression()
+			if err != nil {
+				return node, err
+			}
+			node.Nodes = []Node{val}
+			node.VarID = val.VarID
+		}
+		return node, nil
 
 	case ECast:
 		// Format: [Opcode] + [Target: Expr] + [HasType: Byte] + [OptionalType: Uleb128]
-		if err := r.readExpression(); err != nil {
-			return err
+		target, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
-		hasType, _ := r.readByte()
+		node.Nodes = []Node{target}
+		node.VarID = target.VarID
+		hasType, err := r.readByte()
+		if err != nil {
+			return node, err
+		}
 		if hasType == 1 {
-			_, _ = r.readUleb128()
+			if _, err := r.readUleb128(); err != nil {
+				return node, err
+			}
 		}
+		return node, nil
 
 	case ETernary:
 		// Format: [Opcode] + [Cond: Expr] + [Then: Expr] + [Else: Expr]
-		if err := r.readExpression(); err != nil {
-			return err
+		cond, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
-		if err := r.readExpression(); err != nil {
-			return err
+		thenExpr, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
-		if err := r.readExpression(); err != nil {
-			return err
+		elseExpr, err := r.readExpression()
+		if err != nil {
+			return node, err
 		}
+		node.Nodes = []Node{cond}
+		node.ThenBlock = []Node{thenExpr}
+		node.ElseBlock = []Node{elseExpr}
+		return node, nil
 
 	case EBreak, EContinue:
 		// Leaf nodes: Exit immediately
-		return nil
+		return node, nil
 
 	default:
 		// Fall-through catch-all for complex nested structures (ESwitch, ETry, EDisplay)
 		// These carry highly specialized embedded tables we can flesh out as needed.
+		return node, nil
 	}
-
-	return nil
 }
 
-// Pass1 parses the binary cache into structured node lists and evaluates variable lifespans.
+// Pass1 parses the binary stream into the real Node tree (via Reader.Read,
+// which now dispatches EFD/EXD into readExpression thanks to the whitelist
+// fix in hxb_reader.go) and caches it on the Annotator. It does NOT run the
+// Typer — that now happens at the start of Pass2, which stashes its
+// Context on TyperObj.Ctx so Pass2 can build Tags from it directly.
 func (a *Annotator) Pass1(targetApi ReaderApi) (*Module, error) {
 	a.Pos = 0
 	a.Tags = nil
 
-	// Step A: Read the binary layout stream to build your structured Module node tree natively
 	m, err := a.Reader.Read(targetApi)
 	if err != nil {
 		return nil, err
 	}
 
-	// Step B: Extract the authentic EXD expression node slice compiled by Haxe
-	var programNodes []Node
-	if m != nil {
-		// Aligned directly to the flat nodes/expression fields array list in your hxb_reader.go
-		// programNodes = m.Nodes
-	}
-
-	// Step C: Instantiate your native Context tracking wrapper from typer.go
-	ctx := &Context{
-		Variables: make(map[int]VariableTrack),
-	}
-
-	// Step D: Execute your flow analysis logic to process the block branches
-	a.TyperObj.ProcessBlock(programNodes, ctx)
-
-	// Step E: Loop over your native variables context to determine target layout markers
-	for id, vTrack := range ctx.Variables {
-		targetPlace := Stack
-		if vTrack.State == Leaked {
-			targetPlace = UnmanagedHeap
-		}
-
-		layoutOffset := int32(-16) // Default fallback hardware spacing tracking metrics
-
-		// Directly append the minimal splicing tag. Since your fixed-window scanner
-		// handles the stream, a.Pos tracks the exact binary index coordinates.
-		a.Tags = append(a.Tags, Tag{
-			Pos:   a.Pos,
-			Place: targetPlace,
-			Off:   layoutOffset,
-		})
-
-		// To suppress Go compile-time unused diagnostics for the local variable mapping 'id'
-		_ = id
-	}
-
+	a.Nodes = a.Reader.Nodes
 	return m, nil
 }
 
-/*
-// Pass2 streams out the original binary block contents and appends the custom hidden crL chunk payload.
-func (a *Annotator) Pass2() []byte {
-	var out bytes.Buffer
-	n := len(a.Buf)
+// findEOMOffset locates the EOM chunk the same tolerant way Reader.Read
+// parses the whole file: scan for a valid chunk name, read its size, and
+// if the cursor drifts (an unrecognized or misaligned chunk), re-scan
+// forward byte-by-byte for the next valid anchor rather than trusting size
+// math blindly. This deliberately mirrors Read()'s self-healing window
+// scanner, since real hxb.cross output can hit exactly the drift it
+// recovers from — a plain substring search for "EOM" would not share that
+// tolerance and could misalign against real files.
+func findEOMOffset(buf []byte) (int, error) {
+	pos := 4 // skip "hxb\x01" magic
+	window := make([]byte, 3)
 
-	// Step A: Find the final EOM (End of Module) marker boundary inside your buffer
-	eomPos := n
-	for i := n - 3; i >= 0; i-- {
-		if string(a.Buf[i:i+3]) == "EOM" {
-			eomPos = i
-			break
-		}
-	}
+	for pos+3 <= len(buf) {
+		copy(window, buf[pos:pos+3])
+		nameStr := string(window)
 
-	// Stream original standard HXB payload chunks untouched right up to the end boundary
-	out.Write(a.Buf[:eomPos])
-
-	// Step B: Serialize custom tags into a temporary payload buffer
-	var crlBuf bytes.Buffer
-	if len(a.Tags) > 0 {
-		// Write out the total count of injections being registered in this module file
-		crlBuf.WriteByte(byte(len(a.Tags)))
-
-		for _, t := range a.Tags {
-			// Write Pos as a 4-byte Int32 to ensure non-trivial file sizes never truncate coordinates
-			binary.Write(&crlBuf, binary.BigEndian, int32(t.Pos))
-
-			// Write the hardware destination placement byte (Stack, UnmanagedHeap, etc.)
-			crlBuf.WriteByte(t.Place)
-
-			// Universal cross-language bit shifts for the layout displacement mapping
-			crlBuf.WriteByte(byte(t.Off & 0xFF))
-			crlBuf.WriteByte(byte((t.Off >> 8) & 0xFF))
-			crlBuf.WriteByte(byte((t.Off >> 16) & 0xFF))
-			crlBuf.WriteByte(byte((t.Off >> 24) & 0xFF))
+		if !validChunks[nameStr] {
+			// Drift recovery: slide forward one byte at a time until the
+			// window lands back on a recognized chunk name.
+			found := false
+			for p := pos + 1; p+3 <= len(buf); p++ {
+				copy(window, buf[p:p+3])
+				if validChunks[string(window)] {
+					pos = p
+					nameStr = string(window)
+					found = true
+					break
+				}
+			}
+			if !found {
+				return 0, fmt.Errorf("%w: EOM chunk not found", ErrHxbReaderException)
+			}
 		}
 
-		// Step C: Inject the pre-registered 3-character hidden "crL" chunk identifier header
-		out.Write([]byte("crL"))
+		if pos+7 > len(buf) {
+			return 0, fmt.Errorf("%w: truncated chunk header near offset %d", ErrHxbReaderException, pos)
+		}
+		if ChunkKind(nameStr) == EOM {
+			return pos, nil
+		}
 
-		// Write chunk payload data size width as Big-Endian Int32 to match standard chunk formats
-		chunkSize := int32(crlBuf.Len())
-		binary.Write(&out, binary.BigEndian, chunkSize)
-
-		// Dump the actual serialization payload body contents
-		out.Write(crlBuf.Bytes())
+		size := int(binary.BigEndian.Uint32(buf[pos+3 : pos+7]))
+		pos += 7 + size
 	}
 
-	// Step D: Write out the final EOM trailing block sequence to terminate the file smoothly
-	out.Write([]byte("EOM"))
-	binary.Write(&out, binary.BigEndian, int32(0))
-
-	return out.Bytes()
+	return 0, fmt.Errorf("%w: EOM chunk not found", ErrHxbReaderException)
 }
-*/
-// Pass2 streams out the original binary block contents and appends the custom hidden crL chunk payload.
-func (a *Annotator) Pass2() []byte {
-	var out bytes.Buffer
-	n := len(a.Buf)
 
-	// Find the final EOM (End of Module) marker boundary inside your buffer
-	eomPos := n
-	for i := n - 3; i >= 0; i-- {
-		if string(a.Buf[i:i+3]) == "EOM" {
-			eomPos = i
-			break
-		}
+// writeCrLChunk serializes tags into a fully-framed crL chunk (3-byte name,
+// 4-byte big-endian size, then payload) matching the exact wire format
+// hxb_reader.readcrL/applyLinearityState expects: uleb128(count), then per
+// entry uleb128(pos), uleb128(varID), byte(place). Correct framing is what
+// lets a generic hxb reader that has never heard of "crL" skip straight
+// past it via its own size-based skip logic and land exactly on EOM.
+func writeCrLChunk(out *bytes.Buffer, tags []Tag) {
+	if len(tags) == 0 {
+		return
 	}
-
-	// Stream original standard HXB payload chunks untouched right up to the end boundary
-	out.Write(a.Buf[:eomPos])
-
-	// Serialize custom tags into a temporary payload buffer
 	var crlBuf bytes.Buffer
-	if len(a.Tags) > 0 {
-		crlBuf.WriteByte(byte(len(a.Tags)))
+	writeUleb128(&crlBuf, len(tags))
+	for _, t := range tags {
+		writeUleb128(&crlBuf, t.Pos)
+		writeUleb128(&crlBuf, t.VarID)
+		crlBuf.WriteByte(t.Place)
+	}
+	out.WriteString(string(crL))
+	binary.Write(out, binary.BigEndian, int32(crlBuf.Len()))
+	out.Write(crlBuf.Bytes())
+}
 
-		for _, t := range a.Tags {
-			binary.Write(&crlBuf, binary.BigEndian, int32(t.Pos))
-			crlBuf.WriteByte(t.Place)
+// writeEOMChunk re-appends the standard, empty-payload EOM terminator.
+func writeEOMChunk(out *bytes.Buffer) {
+	out.WriteString(string(EOM))
+	binary.Write(out, binary.BigEndian, int32(0))
+}
 
-			crlBuf.WriteByte(byte(t.Off & 0xFF))
-			crlBuf.WriteByte(byte((t.Off >> 8) & 0xFF))
-			crlBuf.WriteByte(byte((t.Off >> 16) & 0xFF))
-			crlBuf.WriteByte(byte((t.Off >> 24) & 0xFF))
-		}
+// Pass2 runs the Typer's flow analysis over the nodes Pass1 parsed
+// (SpecializeAndCheck stashes its Context on TyperObj.Ctx), builds Tags
+// from the result, then re-emits the original chunk stream up to EOM
+// followed by a crL chunk carrying those tags, then EOM.
+//
+// NOTE: signature changed from `func (a *Annotator) Pass2() []byte` to
+// return an error too, since findEOMOffset can now genuinely fail instead
+// of silently defaulting to "append at the end". Update call sites (e.g.
+// main.go: `hxbPlusBytes, err := annot.Pass2()`) accordingly.
+func (a *Annotator) Pass2() ([]byte, error) {
+	a.TyperObj.SpecializeAndCheck(a.Nodes)
 
-		out.Write([]byte("crL"))
-		chunkSize := int32(crlBuf.Len())
-		binary.Write(&out, binary.BigEndian, chunkSize)
-		out.Write(crlBuf.Bytes())
+	a.Tags = nil
+	for id, vTrack := range a.TyperObj.Ctx.Variables {
+		a.Tags = append(a.Tags, Tag{
+			Pos:   vTrack.Offset,
+			VarID: id,
+			Place: byte(vTrack.State),
+		})
 	}
 
-	// Write out the final EOM trailing block sequence to terminate the file smoothly
-	out.Write([]byte("EOM"))
-	binary.Write(&out, binary.BigEndian, int32(0))
+	eomPos, err := findEOMOffset(a.Buf)
+	if err != nil {
+		return nil, err
+	}
 
-	return out.Bytes()
+	var out bytes.Buffer
+	out.Write(a.Buf[:eomPos])
+	writeCrLChunk(&out, a.Tags)
+	writeEOMChunk(&out)
+
+	return out.Bytes(), nil
 }

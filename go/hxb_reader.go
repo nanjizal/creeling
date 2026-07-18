@@ -47,16 +47,20 @@ type LinearityKey struct {
 }
 
 type Reader struct {
-	i            io.Reader
-	api          ReaderApi
-	stringPool   []string
-	classes      []Class
-	enums        []Enum
-	typedefs     []Typedef
-	abstracts    []Abstract
-	anonFields   []ClassField
-	module       *Module
-	linearityMap map[LinearityKey]State
+	i                 io.Reader
+	api               ReaderApi
+	stringPool        []string
+	classes           []Class
+	enums             []Enum
+	typedefs          []Typedef
+	abstracts         []Abstract
+	anonFields        []ClassField
+	module            *Module
+	linearityMap      map[LinearityKey]State
+	currentExprOffset int // EDIT: sequential counter, fulfils the //r.currentExprOffset++ stub that
+	// already existed in the commented-out readExpression draft. Incremented
+	// once per expression visited; becomes Node.Offset.
+	Nodes []Node // EDIT: accumulated top-level parsed expressions (EFD/EXD), in visit order
 }
 
 func NewReader(i io.Reader) *Reader {
@@ -590,11 +594,15 @@ func (r *Reader) readEFD() error {
 		return err
 	}
 
-	// 2. Consume them in order, advancing the file cursor precisely
+	// 2. Consume them in order, advancing the file cursor precisely.
+	// EDIT: capture the returned Node (readExpression now builds a real tree
+	// instead of only skipping bytes) and accumulate it, instead of discarding it.
 	for i := 0; i < exprCount; i++ {
-		if err := r.readExpression(); err != nil {
+		node, err := r.readExpression()
+		if err != nil {
 			return err
 		}
+		r.Nodes = append(r.Nodes, node)
 	}
 	return nil
 }
@@ -606,186 +614,22 @@ func (r *Reader) readAFD() error {
 		return err
 	}
 
+	// EDIT: same accumulation as readEFD above.
 	for i := 0; i < anonCount; i++ {
-		if err := r.readExpression(); err != nil {
+		node, err := r.readExpression()
+		if err != nil {
 			return err
 		}
+		r.Nodes = append(r.Nodes, node)
 	}
 	return nil
 }
 
-/*
-	func (r *Reader) readExpression() error {
-		opByte, err := r.readByte()
-		if err != nil {
-			return err
-		}
-		op := FullOpcode(opByte)
+// NOTE: the real readExpression is defined in Annotator.go, as a *Reader
+// method — this keeps opcode-decoding logic physically grouped with the
+// annotator concern, while still being a normal Reader method with full
+// access to Reader's fields (readByte/readUleb128/currentExprOffset/etc).
 
-		if op == Eof {
-			return nil
-		}
-
-		// Increment your Creeling flow counter on active tokens
-		//r.currentExprOffset++
-
-		switch op {
-		case EConst, ELocal, EType:
-			// Format: [Opcode] + [PoolIndex: Uleb128]
-			_, _ = r.readUleb128()
-
-		case EArray, EIn, EBinop:
-			// Binop format: [Opcode] + [BinopType: Byte] + [Left: Expr] + [Right: Expr]
-			if op == EBinop {
-				_, _ = r.readByte()
-			}
-			if err := r.readExpression(); err != nil {
-				return err
-			} // Left
-			if err := r.readExpression(); err != nil {
-				return err
-			} // Right
-
-		case EField, ECheckType, EMeta:
-			// Format: [Opcode] + [Target: Expr] + [PoolIndex: Uleb128]
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-			_, _ = r.readUleb128()
-
-		case EParenthesis, EUntyped, EThrow:
-			// Format: [Opcode] + [Inner: Expr]
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-
-		case EObjectDecl:
-			// Format: [Opcode] + [Count: Uleb128] + N * ([FieldNameIndex: Uleb128] + [Value: Expr])
-			count, _ := r.readUleb128()
-			for i := 0; i < int(count); i++ {
-				_, _ = r.readUleb128()
-				if err := r.readExpression(); err != nil {
-					return err
-				}
-			}
-
-		case EArrayDecl, EBlock:
-			// Format: [Opcode] + [Count: Uleb128] + N * [Item: Expr]
-			count, _ := r.readUleb128()
-			for i := 0; i < int(count); i++ {
-				if err := r.readExpression(); err != nil {
-					return err
-				}
-			}
-
-		case ECall, ENew:
-			// ECall format: [Opcode] + [Target: Expr] + [ArgCount: Uleb128] + N * [Arg: Expr]
-			// ENew format:  [Opcode] + [ClassIdx: Uleb128] + [ArgCount: Uleb128] + N * [Arg: Expr]
-			if op == ECall {
-				if err := r.readExpression(); err != nil {
-					return err
-				}
-			} else {
-				_, _ = r.readUleb128() // ClassIdx
-			}
-			argCount, _ := r.readUleb128()
-			for i := 0; i < int(argCount); i++ {
-				if err := r.readExpression(); err != nil {
-					return err
-				}
-			}
-
-		case EUnop:
-			// Format: [Opcode] + [OpType: Byte] + [IsPostfix: Byte] + [Target: Expr]
-			_, _ = r.readByte()
-			_, _ = r.readByte()
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-
-		case EFunction:
-			// Format: [Opcode] + [NameIdx: Uleb128] + [FuncSignature details...]
-			_, _ = r.readUleb128()
-			// (Assuming a basic delegate jump or custom function block skip is handled here)
-
-		case EFor:
-			// Format: [Opcode] + [LoopVarIdx: Uleb128] + [Iter: Expr] + [Body: Expr]
-			_, _ = r.readUleb128()
-			if err := r.readExpression(); err != nil {
-				return err
-			} // Iterator
-			if err := r.readExpression(); err != nil {
-				return err
-			} // Loop Body
-
-		case EIf:
-			// Format: [Opcode] + [Cond: Expr] + [Then: Expr] + [HasElse: Byte] + [OptionalElse: Expr]
-			if err := r.readExpression(); err != nil {
-				return err
-			} // Condition
-			if err := r.readExpression(); err != nil {
-				return err
-			} // Then
-			hasElse, _ := r.readByte()
-			if hasElse == 1 {
-				if err := r.readExpression(); err != nil {
-					return err
-				} // Else
-			}
-
-		case EWhile:
-			// Format: [Opcode] + [Cond: Expr] + [Body: Expr] + [IsDoWhile: Byte]
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-			_, _ = r.readByte()
-
-		case EReturn:
-			// Format: [Opcode] + [HasValue: Byte] + [OptionalValue: Expr]
-			hasValue, _ := r.readByte()
-			if hasValue == 1 {
-				if err := r.readExpression(); err != nil {
-					return err
-				}
-			}
-
-		case ECast:
-			// Format: [Opcode] + [Target: Expr] + [HasType: Byte] + [OptionalType: Uleb128]
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-			hasType, _ := r.readByte()
-			if hasType == 1 {
-				_, _ = r.readUleb128()
-			}
-
-		case ETernary:
-			// Format: [Opcode] + [Cond: Expr] + [Then: Expr] + [Else: Expr]
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-			if err := r.readExpression(); err != nil {
-				return err
-			}
-
-		case EBreak, EContinue:
-			// Leaf nodes: Exit immediately
-			return nil
-
-		default:
-			// Fall-through catch-all for complex nested structures (ESwitch, ETry, EDisplay)
-			// These carry highly specialized embedded tables we can flesh out as needed.
-		}
-
-		return nil
-	}
-*/
 func (r *Reader) readcrL() error {
 	// Parse your custom linearity instructions
 	actionCount, err := r.readUleb128()
@@ -878,7 +722,13 @@ func (r *Reader) readChunkData(kind ChunkKind, size int) error {
 	case EXD:
 		// Method bodies (logic, loops, variables) converts
 		// bytecode into []Node for the Typer.
-		return r.readExpression()
+		// EDIT: capture and accumulate the returned Node, same as readEFD/readAFD.
+		node, err := r.readExpression()
+		if err != nil {
+			return err
+		}
+		r.Nodes = append(r.Nodes, node)
+		return nil
 	case MDR:
 		// Return a baseline token or fall back to an existing descriptive chunk type
 		// so the master loop can safely read its 4-byte size header and step past it
@@ -897,55 +747,6 @@ func (r *Reader) readChunkData(kind ChunkKind, size int) error {
 	return nil
 }
 
-/*
-	func (r *Reader) Read(api ReaderApi) (*Module, error) {
-		r.api = api
-		r.module = nil
-
-		magicBuf := make([]byte, 3)
-		if _, err := io.ReadFull(r.i, magicBuf); err != nil {
-			return nil, err
-		}
-		if string(magicBuf) != "hxb" {
-			return nil, r.fail(fmt.Sprintf("Expected magic to be hxb, but it is %s", string(magicBuf)))
-		}
-
-		_, err := r.readByte() // Read and discard version byte
-		if err != nil {
-			return nil, err
-		}
-
-		chunkNameBuf := make([]byte, 3)
-		for {
-			_, err := io.ReadFull(r.i, chunkNameBuf)
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				return nil, err
-			}
-
-			var chunkSize int32
-			if err := binary.Read(r.i, binary.BigEndian, &chunkSize); err != nil {
-				return nil, err
-			}
-
-			chunkKind, err := ChunkKindFromString(string(chunkNameBuf))
-			if err != nil {
-				return nil, err
-			}
-
-			if chunkKind == EOM {
-				break
-			}
-
-			if err := r.readChunkData(chunkKind, int(chunkSize)); err != nil {
-				return nil, err
-			}
-		}
-		return r.module, nil
-	}
-*/
 func (r *Reader) Read(api ReaderApi) (*Module, error) {
 	r.api = api
 	magicBuf := make([]byte, 4)
@@ -972,7 +773,7 @@ func (r *Reader) Read(api ReaderApi) (*Module, error) {
 		chunkKind, err := ChunkKindFromString(nameStr)
 
 		// ====================================================================
-		// 🎯 SELF-HEALING FIXED-WINDOW ANCHOR SCANNER
+		// SELF-HEALING FIXED-WINDOW ANCHOR SCANNER
 		// ====================================================================
 		// If an inner decoder over-reads, or we hit an unhandled experimental chunk,
 		// scan forward byte-by-byte keeping a strict 3-byte validation window active.
@@ -1014,7 +815,13 @@ func (r *Reader) Read(api ReaderApi) (*Module, error) {
 		// ====================================================================
 		// Process core operational structures natively, but safely step past fluid
 		// or un-utilized metadata chunks (like empty MTF sequences) using their sizes.
-		if chunkKind == EXD || chunkKind == STR || chunkKind == MDF_Chunk {
+		//
+		// EDIT: added EFD and crL to this whitelist. Previously only
+		// EXD/STR/MDF_Chunk reached readChunkData — meaning readEFD (which
+		// actually builds the node stream the Typer needs) and readcrL
+		// (needed to read an already-annotated hxbPlus file back) were both
+		// fully implemented but structurally unreachable from this loop.
+		if chunkKind == EXD || chunkKind == STR || chunkKind == MDF_Chunk || chunkKind == EFD || chunkKind == crL {
 			if err := r.readChunkData(chunkKind, int(chunkSize)); err != nil {
 				fmt.Printf("[Pipeline Warning] Managed internal error inside %s chunk: %v\n", nameStr, err)
 			}

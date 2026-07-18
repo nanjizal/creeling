@@ -9,6 +9,7 @@ type Node struct {
 	VarID     int
 	MethodID  string
 	Field     string
+	Offset    int // EDIT: byte offset where this node begins, set by readExpression
 	Nodes     []Node
 	ThenBlock []Node
 	ElseBlock []Node
@@ -16,8 +17,9 @@ type Node struct {
 }
 
 type VariableTrack struct {
-	ID    int
-	State State
+	ID     int
+	State  State
+	Offset int // EDIT: carries Node.Offset through from where the var was declared
 }
 
 type Context struct {
@@ -27,6 +29,8 @@ type Context struct {
 // CreelingTyper
 type Typer struct {
 	Instructions []string
+	Ctx          *Context // EDIT: the Context populated by the most recent SpecializeAndCheck/ProcessBlock run,
+	// so callers (e.g. Annotator.Pass2) can inspect ctx.Variables afterward.
 }
 
 func NewTyper() *Typer {
@@ -63,8 +67,9 @@ func (t *Typer) ProcessNode(node Node, ctx *Context) {
 			if childNode.VarID != 0 {
 				if _, active := ctx.Variables[childNode.VarID]; !active {
 					ctx.Variables[childNode.VarID] = VariableTrack{
-						ID:    childNode.VarID,
-						State: Owned,
+						ID:     childNode.VarID,
+						State:  Owned,
+						Offset: childNode.Offset, // EDIT: carry the real byte offset through
 					}
 					t.Instructions = append(t.Instructions, "ALLOC_VAR var_"+strconv.Itoa(childNode.VarID))
 				}
@@ -181,6 +186,7 @@ func (t *Typer) SpecializeAndCheck(program []Node) []string {
 		Variables: make(map[int]VariableTrack),
 	}
 	t.ProcessBlock(program, ctx)
+	t.Ctx = ctx // EDIT: stash so callers (e.g. Annotator.Pass2) can inspect ctx.Variables afterward
 	return t.Instructions
 }
 func (t *Typer) nodeUsesVariable(node Node, varID int) bool {
