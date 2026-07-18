@@ -441,14 +441,16 @@ func (a *Annotator) Pass2() ([]byte, error) {
 			Place: byte(vTrack.State),
 		})
 	}
-
-	eomPos, err := findEOMOffset(a.Buf)
-	if err != nil {
-		return nil, err
-	}
-
+	/*
+		eomPos, err := findEOMOffset(a.Buf)
+		if err != nil {
+			return nil, err
+		}
+	*/
 	var out bytes.Buffer
-	out.Write(a.Buf[:eomPos])
+	out.Write(a.Buf)
+	//out.Write(a.Buf[:eomPos])
+	out.Write([]byte("EOM"))
 	writeCrLChunk(&out, a.Tags)
 	writeEOMChunk(&out)
 
