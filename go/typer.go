@@ -4,86 +4,75 @@ import (
 	"strconv"
 )
 
-type Node struct {
-	Kind      FullOpcode
-	VarID     int
-	MethodID  string
-	Field     string
-	Offset    int // EDIT: byte offset where this node begins, set by readExpression
-	Nodes     []Node
-	ThenBlock []Node
-	ElseBlock []Node
-	//Args      []Node
-}
-
-type VariableTrack struct {
-	ID     int
-	State  State
-	Offset int // EDIT: carries Node.Offset through from where the var was declared
-}
-
+// Context manages the transient, scoped dictionary map of live variable flow trackers.
+// Fields:
+//
+//	Variables - Active variable symbols indexed by their unique ID
 type Context struct {
-	Variables map[int]VariableTrack
+	Variables map[int]Flow
 }
 
-// CreelingTyper
+func (ctx *Context) Clone() *Context {
+	cloned := &Context{
+		Variables: make(map[int]Flow),
+	}
+	for k, v := range ctx.Variables {
+		cloned.Variables[k] = v
+	}
+	return cloned
+}
+
 type Typer struct {
 	Instructions []string
-	Ctx          *Context // EDIT: the Context populated by the most recent SpecializeAndCheck/ProcessBlock run,
-	// so callers (e.g. Annotator.Pass2) can inspect ctx.Variables afterward.
+	Ctx          *Context
+	Tags         []Tag
 }
 
 func NewTyper() *Typer {
 	return &Typer{Instructions: make([]string, 0)}
 }
 
-// Flow analysis
+// ProcessNode analyzes flow semantics and maps variable state changes.
 func (t *Typer) ProcessNode(node Node, ctx *Context) {
 	switch node.Kind {
 	case ECall:
-		track, exists := ctx.Variables[node.VarID]
+		flow, exists := ctx.Variables[node.VarID]
 		argState := Borrow
 
-		if exists && track.State == Owned {
+		if exists && flow.State == Owned {
 			argState = Owned
-			track.State = Borrow
-			ctx.Variables[node.VarID] = track
+			flow.State = Borrow
+			ctx.Variables[node.VarID] = flow
 		}
 
 		stateStr := "Borrow"
 		if argState == Owned {
 			stateStr = "Owned"
 		}
-		t.Instructions = append(t.Instructions, "CALL_METHOD"+"_Variant_"+stateStr)
+		t.Instructions = append(t.Instructions, "CALL_METHOD_Variant_"+stateStr)
 
 	case EField:
-		if track, exists := ctx.Variables[node.VarID]; exists {
-			track.State = Leaked
-			ctx.Variables[node.VarID] = track
+		if flow, exists := ctx.Variables[node.VarID]; exists {
+			flow.State = Leaked
+			ctx.Variables[node.VarID] = flow
 			t.Instructions = append(t.Instructions, "UPGRADE_TO_RUNTIME_RC_var"+strconv.Itoa(node.VarID))
 		}
+
 	case EBlock:
 		for _, childNode := range node.Nodes {
 			if childNode.VarID != 0 {
 				if _, active := ctx.Variables[childNode.VarID]; !active {
-					ctx.Variables[childNode.VarID] = VariableTrack{
+					ctx.Variables[childNode.VarID] = Flow{
 						ID:     childNode.VarID,
 						State:  Owned,
-						Offset: childNode.Offset, // EDIT: carry the real byte offset through
+						Offset: childNode.Offset,
 					}
 					t.Instructions = append(t.Instructions, "ALLOC_VAR var_"+strconv.Itoa(childNode.VarID))
 				}
 			}
 			t.ProcessNode(childNode, ctx)
 		}
-		/*
-			case NodeVarDecl:
-				ctx.Variables[node.VarID] = VariableTrack{
-					ID:    node.VarID,
-					State: Owned,
-				}
-				t.Instructions = append(t.Instructions, "ALLOC_VAR var_"+strconv.Itoa(node.VarID))
-		*/
+
 	case EIf:
 		thenContext := ctx.Clone()
 		elseContext := ctx.Clone()
@@ -97,14 +86,41 @@ func (t *Typer) ProcessNode(node Node, ctx *Context) {
 	}
 }
 
-func (ctx *Context) Clone() *Context {
-	cloned := &Context{
-		Variables: make(map[int]VariableTrack),
+func (t *Typer) MergeBranchUnification(thenCtx *Context, elseCtx *Context) *Context {
+	merged := &Context{
+		Variables: make(map[int]Flow),
 	}
-	for k, v := range ctx.Variables {
-		cloned.Variables[k] = v
+	allIDs := make(map[int]bool)
+	for id := range thenCtx.Variables {
+		allIDs[id] = true
 	}
-	return cloned
+	for id := range elseCtx.Variables {
+		allIDs[id] = true
+	}
+
+	for id := range allIDs {
+		thenFlow, inThen := thenCtx.Variables[id]
+		elseFlow, inElse := elseCtx.Variables[id]
+
+		if inThen && inElse && thenFlow.State == Owned && elseFlow.State == Owned {
+			merged.Variables[id] = Flow{
+				ID:     id,
+				State:  Owned,
+				Offset: thenFlow.Offset,
+			}
+		} else {
+			refOffset := 0
+			if inThen {
+				refOffset = thenFlow.Offset
+			}
+			merged.Variables[id] = Flow{
+				ID:     id,
+				State:  Leaked,
+				Offset: refOffset,
+			}
+		}
+	}
+	return merged
 }
 
 func (t *Typer) ProcessBlock(stream []Node, ctx *Context) {
@@ -117,11 +133,9 @@ func (t *Typer) ProcessBlock(stream []Node, ctx *Context) {
 		}
 
 		if targetVarID != 0 {
-			// FIX 1: Pass targetVarID here instead of node.VarID!
 			isUsedLater := t.evaluateLivenessPruning(idx, targetVarID, stream)
 
 			if !isUsedLater {
-				// FIX 2: Check and remove using targetVarID as well
 				if _, exists := ctx.Variables[targetVarID]; exists {
 					t.Instructions = append(t.Instructions, "LFR3_FREE var_"+strconv.Itoa(targetVarID))
 					delete(ctx.Variables, targetVarID)
@@ -144,35 +158,7 @@ func (t *Typer) findVariableInBranch(node Node) int {
 	}
 	return 0
 }
-func (t *Typer) MergeBranchUnification(thenCtx *Context, elseCtx *Context) *Context {
-	merged := &Context{
-		Variables: make(map[int]VariableTrack),
-	}
-	allIDs := make(map[int]bool)
-	for id := range thenCtx.Variables {
-		allIDs[id] = true
-	}
-	for id := range elseCtx.Variables {
-		allIDs[id] = true
-	}
 
-	for id := range allIDs {
-		thenTrack, inThen := thenCtx.Variables[id]
-		elseTrack, inElse := elseCtx.Variables[id]
-		if inThen && inElse && thenTrack.State == Owned && elseTrack.State == Owned {
-			merged.Variables[id] = VariableTrack{
-				ID:    id,
-				State: Owned,
-			}
-		} else {
-			merged.Variables[id] = VariableTrack{
-				ID:    id,
-				State: Leaked,
-			}
-		}
-	}
-	return merged
-}
 func (t *Typer) evaluateLivenessPruning(currentIdx int, varID int, stream []Node) bool {
 	for i := currentIdx + 1; i < len(stream); i++ {
 		if t.nodeUsesVariable(stream[i], varID) {
@@ -181,14 +167,7 @@ func (t *Typer) evaluateLivenessPruning(currentIdx int, varID int, stream []Node
 	}
 	return false
 }
-func (t *Typer) SpecializeAndCheck(program []Node) []string {
-	ctx := &Context{
-		Variables: make(map[int]VariableTrack),
-	}
-	t.ProcessBlock(program, ctx)
-	t.Ctx = ctx // EDIT: stash so callers (e.g. Annotator.Pass2) can inspect ctx.Variables afterward
-	return t.Instructions
-}
+
 func (t *Typer) nodeUsesVariable(node Node, varID int) bool {
 	if node.VarID == varID {
 		return true
@@ -204,4 +183,20 @@ func (t *Typer) nodeUsesVariable(node Node, varID int) bool {
 		}
 	}
 	return false
+}
+func (t *Typer) SpecializeAndCheck(program []Node) []string {
+	ctx := &Context{Variables: make(map[int]Flow)}
+	t.ProcessBlock(program, ctx)
+	t.Ctx = ctx
+
+	// Automatically extract and format everything right here
+	t.Tags = make([]Tag, 0, len(ctx.Variables))
+	for id, f := range ctx.Variables {
+		t.Tags = append(t.Tags, Tag{
+			Pos:   f.Offset,
+			VarID: id,
+			Place: byte(f.State),
+		})
+	}
+	return t.Instructions
 }

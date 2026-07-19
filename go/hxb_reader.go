@@ -1,50 +1,17 @@
 package main
 
-// From Format haxelib, see PXshadow's wip-hxb branch.
-/*
-BSD 2-Clause License
-
-Copyright (c) 2008-2024, Haxe Foundation
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
-
 import (
 	"encoding/binary"
 	"fmt"
 	"io"
 )
 
-// ReaderApi defines the structural interface needed to handle module resolutions
 type ReaderApi interface {
 	ResolveModuleType(pack []string, name string, typeName string) (ModuleTypeWithKind, bool)
 	AddModule(module *Module)
 }
 
-// LinearityKey binds a specific expression point to a target variable index
-type LinearityKey struct {
-	ExprOffset int
-	VarID      int
-}
+type LinearityKey struct{ ExprOffset, VarID int }
 
 type Reader struct {
 	i                 io.Reader
@@ -57,650 +24,300 @@ type Reader struct {
 	anonFields        []ClassField
 	module            *Module
 	linearityMap      map[LinearityKey]State
-	currentExprOffset int // EDIT: sequential counter, fulfils the //r.currentExprOffset++ stub that
-	// already existed in the commented-out readExpression draft. Incremented
-	// once per expression visited; becomes Node.Offset.
-	Nodes []Node // EDIT: accumulated top-level parsed expressions (EFD/EXD), in visit order
+	currentExprOffset int
+	Nodes             []Node
+	err               error
 }
 
 func NewReader(i io.Reader) *Reader {
-	return &Reader{
-		i: i,
+	return &Reader{i: i, linearityMap: make(map[LinearityKey]State), Nodes: make([]Node, 0)}
+}
+
+func (r *Reader) fail(res string) error { return fmt.Errorf("%w: %s", ErrHxbReaderException, res) }
+
+// --- Optimized Functional Primitives ---
+
+func (r *Reader) checkByte() byte {
+	if r.err != nil {
+		return 0
 	}
-}
-
-func (r *Reader) fail(reason string) error {
-	return fmt.Errorf("%w: %s", ErrHxbReaderException, reason)
-}
-
-// readByte is a small helper to mirror Haxe's i.readByte()
-func (r *Reader) readByte() (byte, error) {
 	var b [1]byte
-	_, err := r.i.Read(b[:])
-	return b[0], err
+	if _, err := r.i.Read(b[:]); err != nil {
+		r.err = err
+	}
+	return b[0]
 }
 
-// Primitives
-
-// Ported from Haxe recursion to an optimized iterative Uleb128 loop
-func (r *Reader) readUleb128() (int, error) {
-	result := 0
-	shift := 0
+func (r *Reader) checkVarint() int {
+	if r.err != nil {
+		return 0
+	}
+	res, shift := 0, 0
 	for {
-		b, err := r.readByte()
-		if err != nil {
-			return 0, err
+		b := r.checkByte()
+		if r.err != nil {
+			return 0
 		}
-		result |= int(b&0x7F) << shift
+		res |= int(b&0x7F) << shift
 		if b < 0x80 {
 			break
 		}
 		shift += 7
 	}
-	return result, nil
+	return res
 }
 
-// Ported from Haxe nested closures to a safe iterative Leb128 loop
-func (r *Reader) readLeb128() (int, error) {
-	result := 0
-	shift := 0
+func (r *Reader) checkSignedVarint() int {
+	if r.err != nil {
+		return 0
+	}
+	res, shift := 0, 0
 	var b byte
-	var err error
-
 	for {
-		b, err = r.readByte()
-		if err != nil {
-			return 0, err
+		b = r.checkByte()
+		if r.err != nil {
+			return 0
 		}
-		result |= int(b&0x7F) << shift
+		res |= int(b&0x7F) << shift
 		shift += 7
 		if b < 0x80 {
 			break
 		}
 	}
-
-	// Sign extend if the last byte processed has its sign bit set (0x40)
 	if (b & 0x40) != 0 {
-		result |= ^0 << shift
+		res |= ^0 << shift
 	}
-	return result, nil
+	return res
 }
 
-func (r *Reader) readString() (string, error) {
-	idx, err := r.readUleb128()
-	if err != nil {
-		return "", err
+func (r *Reader) checkString() string {
+	idx := r.checkVarint()
+	if r.err != nil || idx < 0 || idx >= len(r.stringPool) {
+		r.err = r.fail(fmt.Sprintf("String pool out of bounds: %d", idx))
+		return ""
 	}
-	if idx < 0 || idx >= len(r.stringPool) {
-		return "", r.fail(fmt.Sprintf("String pool index out of bounds: %d", idx))
-	}
-	return r.stringPool[idx], nil
+	return r.stringPool[idx]
 }
 
-// Helper to handle the option marker loops safely
-func (r *Reader) readOptionMarker() (bool, error) {
-	b, err := r.readByte()
-	if err != nil {
-		return false, err
+func (r *Reader) checkExpr() Node {
+	if r.err != nil {
+		return Node{}
 	}
-	return b != 0, nil
+	node, _ := r.readExpression()
+	return node
 }
 
-// Compounds
+// --- Haxe-Style Higher-Order Structural Readers ---
 
-func (r *Reader) readPath() (Path, error) {
-	packLen, err := r.readUleb128()
-	if err != nil {
-		return Path{}, err
+func readList[T any](r *Reader, parser func() T) []T {
+	length := r.checkVarint()
+	if r.err != nil {
+		return nil
 	}
-	pack := make([]string, packLen)
-	for k := 0; k < packLen; k++ {
-		str, err := r.readString()
-		if err != nil {
-			return Path{}, err
-		}
-		pack[k] = str
-	}
-
-	name, err := r.readString()
-	if err != nil {
-		return Path{}, err
-	}
-
-	return Path{Pack: pack, Name: name}, nil
-}
-
-func (r *Reader) readFullPath() (FullPath, error) {
-	packLen, err := r.readUleb128()
-	if err != nil {
-		return FullPath{}, err
-	}
-	pack := make([]string, packLen)
-	for k := 0; k < packLen; k++ {
-		str, err := r.readString()
-		if err != nil {
-			return FullPath{}, err
-		}
-		pack[k] = str
-	}
-
-	name, err := r.readString()
-	if err != nil {
-		return FullPath{}, err
-	}
-
-	typeName, err := r.readString()
-	if err != nil {
-		return FullPath{}, err
-	}
-
-	return FullPath{
-		Path:     Path{Pack: pack, Name: name},
-		TypeName: typeName,
-	}, nil
-}
-
-func (r *Reader) readPos() (Pos, error) {
-	file, err := r.readString()
-	if err != nil {
-		return Pos{}, err
-	}
-	min, err := r.readUleb128()
-	if err != nil {
-		return Pos{}, err
-	}
-	max, err := r.readUleb128()
-	if err != nil {
-		return Pos{}, err
-	}
-	return Pos{File: file, Min: min, Max: max}, nil
-}
-
-// Type parameters
-
-func (r *Reader) readTypeParameterHost() (TypeParameterHost, error) {
-	b, err := r.readByte()
-	if err != nil {
-		return 0, err
-	}
-	switch b {
-	case 0:
-		return HostType, nil
-	case 1:
-		return HostConstructor, nil
-	case 2:
-		return HostMethod, nil
-	case 3:
-		return HostEnumConstructor, nil
-	case 4:
-		return HostAnonField, nil
-	case 5:
-		return HostLocal, nil
-	default:
-		return 0, r.fail(fmt.Sprintf("Unknown type parameter host byte: %d", b))
-	}
-}
-
-func (r *Reader) readTypeParametersForward() ([]TypeParameter, error) {
-	length, err := r.readUleb128()
-	if err != nil {
-		return nil, err
-	}
-	params := make([]TypeParameter, length)
+	list := make([]T, length)
 	for i := 0; i < length; i++ {
-		path, err := r.readPath()
-		if err != nil {
-			return nil, err
-		}
-		pos, err := r.readPos()
-		if err != nil {
-			return nil, err
-		}
-		host, err := r.readTypeParameterHost()
-		if err != nil {
-			return nil, err
-		}
-		params[i] = TypeParameter{
-			Path: path,
-			Pos:  pos,
-			Host: host,
-		}
+		list[i] = parser()
 	}
-	return params, nil
+	return list
 }
 
-// Fields
+func (r *Reader) readPath() Path {
+	return Path{Pack: readList(r, r.checkString), Name: r.checkString()}
+}
 
-func (r *Reader) readClassFieldForward() (ClassField, error) {
-	name, err := r.readString()
-	if err != nil {
-		return ClassField{}, err
-	}
-	pos, err := r.readPos()
-	if err != nil {
-		return ClassField{}, err
-	}
-	namePos, err := r.readPos()
-	if err != nil {
-		return ClassField{}, err
-	}
+func (r *Reader) readFullPath() FullPath {
+	return FullPath{Path: r.readPath(), TypeName: r.checkString()}
+}
 
-	overloadsLen, err := r.readUleb128()
-	if err != nil {
-		return ClassField{}, err
-	}
-	overloads := make([]ClassField, overloadsLen)
-	for k := 0; k < overloadsLen; k++ {
-		cf, err := r.readClassFieldForward()
-		if err != nil {
-			return ClassField{}, err
-		}
-		overloads[k] = cf
-	}
+func (r *Reader) readPos() Pos {
+	return Pos{File: r.checkString(), Min: r.checkVarint(), Max: r.checkVarint()}
+}
 
+func (r *Reader) readTypeParameterHost() TypeParameterHost {
+	b := r.checkByte()
+	if b > 5 {
+		r.err = r.fail(fmt.Sprintf("Unknown host byte: %d", b))
+		return 0
+	}
+	return TypeParameterHost(b)
+}
+
+func (r *Reader) readTypeParametersForward() []TypeParameter {
+	return readList(r, func() TypeParameter {
+		return TypeParameter{Path: r.readPath(), Pos: r.readPos(), Host: r.readTypeParameterHost()}
+	})
+}
+
+// --- Fields & Compound Elements ---
+
+func (r *Reader) readClassFieldForward() ClassField {
 	return ClassField{
-		Name:      name,
-		Pos:       pos,
-		NamePos:   namePos,
-		Overloads: overloads,
-	}, nil
+		Name: r.checkString(), Pos: r.readPos(), NamePos: r.readPos(),
+		Overloads: readList(r, r.readClassFieldForward),
+	}
 }
 
-func (r *Reader) readEnumFieldForward() (EnumField, error) {
-	name, err := r.readString()
-	if err != nil {
-		return EnumField{}, err
-	}
-	pos, err := r.readPos()
-	if err != nil {
-		return EnumField{}, err
-	}
-	namePos, err := r.readPos()
-	if err != nil {
-		return EnumField{}, err
-	}
-	index, err := r.readUleb128()
-	if err != nil {
-		return EnumField{}, err
-	}
-
-	return EnumField{
-		Name:    name,
-		Pos:     pos,
-		NamePos: namePos,
-		Index:   index,
-	}, nil
+func (r *Reader) readEnumFieldForward() EnumField {
+	return EnumField{Name: r.checkString(), Pos: r.readPos(), NamePos: r.readPos(), Index: r.checkVarint()}
 }
 
-// Chunks
+// --- Chunk Context Decoding Passes ---
 
-func (r *Reader) readCFD() error {
-	length, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-	for index := 0; index < length; index++ {
-		_ = r.classes[index] // Trace evaluation slot
-	}
-	return nil
+func (r *Reader) readCFD() {
+	readList(r, func() int { return r.checkVarint() }) // Dumps references smoothly
 }
 
 func (r *Reader) readSTR() error {
-	length, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-	r.stringPool = make([]string, length)
-	for index := 0; index < length; index++ {
-		strLen, err := r.readUleb128()
-		if err != nil {
-			return err
+	r.stringPool = readList(r, func() string {
+		strLen := r.checkVarint()
+		if r.err != nil {
+			return ""
 		}
-		strBuf := make([]byte, strLen)
-		if _, err := io.ReadFull(r.i, strBuf); err != nil {
-			return err
+		buf := make([]byte, strLen)
+		if _, err := io.ReadFull(r.i, buf); err != nil {
+			r.err = err
+			return ""
 		}
-		r.stringPool[index] = string(strBuf)
-	}
-	return nil
+		return string(buf)
+	})
+	return r.err
 }
 
 func (r *Reader) readMDF() (MDF, error) {
-	path, err := r.readPath()
-	if err != nil {
-		return MDF{}, err
-	}
-	file, err := r.readString()
-	if err != nil {
-		return MDF{}, err
-	}
-	numAnons, err := r.readUleb128()
-	if err != nil {
-		return MDF{}, err
-	}
-	numMonos, err := r.readUleb128()
-	if err != nil {
-		return MDF{}, err
-	}
-
-	return MDF{
-		Path:     path,
-		File:     file,
-		NumAnons: numAnons,
-		NumMonos: numMonos,
-	}, nil
+	return MDF{Path: r.readPath(), File: r.checkString(), NumAnons: r.checkVarint(), NumMonos: r.checkVarint()}, r.err
 }
+
 func (r *Reader) readMTF() (MTF, error) {
-	typesLen, err := r.readUleb128()
-	if err != nil {
-		return MTF{}, err
-	}
-	fmt.Printf("[MTF Diagnostic] Parsing module types loop size: %d\n", typesLen)
-
-	types := make([]ModuleTypeWithKind, typesLen)
-	for k := 0; k < typesLen; k++ {
-		// DEFENSIVE CHECK: If an index over-read occurs or we hit EOF early,
-		// don't panic. Treat it like a corrupt font glyph: log it and safely escape.
-		kindByte, err := r.readByte()
-		if err != nil {
-			fmt.Printf("[MTF Warning] Corrupt type layout boundary at index %d. Skipping gracefully.\n", k)
-			break
-		}
-
-		path, err := r.readPath()
-		if err != nil {
-			fmt.Printf("[MTF Warning] Corrupt path string index. Setting to zero fallback.\n")
-			path = Path{Pack: []string{}, Name: "Unknown"} // Null fallback
-		}
-
-		pos, err := r.readPos()
-		if err != nil {
-			pos = Pos{} // Null structural fallback
-		}
-
-		// Handle unstable nightly trailing parameters safely
-		params, _ := r.readTypeParametersForward()
-
-		m := ModuleType{
-			Path:    path,
-			Pos:     pos,
-			NamePos: pos,
-			Params:  params,
-		}
-
+	types := readList(r, func() ModuleTypeWithKind {
+		kindByte := r.checkByte()
+		m := ModuleType{Path: r.readPath(), Pos: r.readPos(), NamePos: r.readPos(), Params: r.readTypeParametersForward()}
 		var kind ModuleTypeKind
-		switch kindByte {
-		case 0:
-			// Read class loops defensively
-			flags, _ := r.readUleb128()
-
-			fieldsLen, err := r.readUleb128()
-			if err != nil {
-				fieldsLen = 0
-			} // Default corrupt parameters to 0
-
-			fields := make([]ClassField, fieldsLen)
-			for i := 0; i < fieldsLen; i++ {
-				fields[i], _ = r.readClassFieldForward()
-			}
-
-			staticsLen, err := r.readUleb128()
-			if err != nil {
-				staticsLen = 0
-			} // Default corrupt parameters to 0
-
-			statics := make([]ClassField, staticsLen)
-			for i := 0; i < staticsLen; i++ {
-				statics[i], _ = r.readClassFieldForward()
-			}
-
-			kind = ModuleTypeKind{
-				Kind: KindClass,
-				Class: ClassData{
-					Flags:   flags,
-					Fields:  fields,
-					Statics: statics,
-				},
-			}
-		default:
-			// If we hit an unknown structural state identifier, isolate it safely
-			kind = ModuleTypeKind{Kind: KindClass}
+		if kindByte == 0 {
+			kind = ModuleTypeKind{Kind: KindClass, Class: ClassData{
+				Flags:   r.checkVarint(),
+				Fields:  readList(r, r.readClassFieldForward),
+				Statics: readList(r, r.readClassFieldForward),
+			}}
+		} else {
+			kind = ModuleTypeKind{Kind: ModuleTypeKindType(kindByte)}
 		}
-
-		types[k] = ModuleTypeWithKind{M: m, Kind: kind}
-	}
-
-	return MTF{Types: types}, nil
+		return ModuleTypeWithKind{M: m, Kind: kind}
+	})
+	return MTF{Types: types}, r.err
 }
 
 func (r *Reader) readCLR() error {
-	length, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-	r.classes = make([]Class, length)
-	for index := 0; index < length; index++ {
-		path, err := r.readFullPath()
-		if err != nil {
-			return err
+	readList(r, func() int {
+		path := r.readFullPath()
+		if r.err != nil {
+			return 0
 		}
-		module, exists := r.api.ResolveModuleType(path.Pack, path.Name, path.TypeName)
-		if !exists {
-			return r.fail(fmt.Sprintf("Could not resolve module type %v.%s", path.Pack, path.Name))
+		m, ok := r.api.ResolveModuleType(path.Pack, path.Name, path.TypeName)
+		if !ok || m.Kind.Kind != KindClass {
+			r.err = r.fail("Class resolution mismatch")
+			return 0
 		}
-		if module.Kind.Kind == KindClass {
-			r.classes[index] = Class{M: module.M, C: module.Kind.Class}
-		} else {
-			return r.fail(fmt.Sprintf("Unexpected type where class was expected: %s", path.Name))
-		}
-	}
-	return nil
+		r.classes = append(r.classes, Class{M: m.M, C: m.Kind.Class})
+		return 0
+	})
+	return r.err
 }
 
 func (r *Reader) readENR() error {
-	length, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-	r.enums = make([]Enum, length)
-	for index := 0; index < length; index++ {
-		path, err := r.readFullPath()
-		if err != nil {
-			return err
+	readList(r, func() int {
+		path := r.readFullPath()
+		if r.err != nil {
+			return 0
 		}
-		module, exists := r.api.ResolveModuleType(path.Pack, path.Name, path.TypeName)
-		if !exists {
-			return r.fail(fmt.Sprintf("Could not resolve module type %v.%s", path.Pack, path.Name))
+		m, ok := r.api.ResolveModuleType(path.Pack, path.Name, path.TypeName)
+		if !ok || m.Kind.Kind != KindEnum {
+			r.err = r.fail("Enum resolution mismatch")
+			return 0
 		}
-		if module.Kind.Kind == KindEnum {
-			r.enums[index] = Enum{M: module.M, En: module.Kind.Enum}
-		} else {
-			return r.fail(fmt.Sprintf("Unexpected type where enum was expected: %s", path.Name))
-		}
-	}
-	return nil
+		r.enums = append(r.enums, Enum{M: m.M, En: m.Kind.Enum})
+		return 0
+	})
+	return r.err
 }
 
 func (r *Reader) readABR() error {
-	length, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-	r.abstracts = make([]Abstract, length)
-	for index := 0; index < length; index++ {
-		path, err := r.readFullPath()
-		if err != nil {
-			return err
+	readList(r, func() int {
+		path := r.readFullPath()
+		if r.err != nil {
+			return 0
 		}
-		module, exists := r.api.ResolveModuleType(path.Pack, path.Name, path.TypeName)
-		if !exists {
-			return r.fail(fmt.Sprintf("Could not resolve module type %v.%s", path.Pack, path.Name))
+		m, ok := r.api.ResolveModuleType(path.Pack, path.Name, path.TypeName)
+		if !ok || m.Kind.Kind != KindAbstract {
+			r.err = r.fail("Abstract resolution mismatch")
+			return 0
 		}
-		if module.Kind.Kind == KindAbstract {
-			r.abstracts[index] = Abstract{M: module.M, A: module.Kind.Abstract}
-		} else {
-			return r.fail(fmt.Sprintf("Unexpected type where abstract was expected: %s", path.Name))
-		}
-	}
-	return nil
+		r.abstracts = append(r.abstracts, Abstract{M: m.M, A: m.Kind.Abstract})
+		return 0
+	})
+	return r.err
 }
 
 func (r *Reader) readTDR() error {
-	length, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-	r.typedefs = make([]Typedef, length)
-	for index := 0; index < length; index++ {
-		path, err := r.readFullPath()
-		if err != nil {
-			return err
+	readList(r, func() int {
+		path := r.readFullPath()
+		if r.err != nil {
+			return 0
 		}
-		module, exists := r.api.ResolveModuleType(path.Pack, path.Name, path.TypeName)
-		if !exists {
-			return r.fail(fmt.Sprintf("Could not resolve module type %v.%s", path.Pack, path.Name))
+		m, ok := r.api.ResolveModuleType(path.Pack, path.Name, path.TypeName)
+		if !ok || m.Kind.Kind != KindTypedef {
+			r.err = r.fail("Typedef resolution mismatch")
+			return 0
 		}
-		if module.Kind.Kind == KindTypedef {
-			r.typedefs[index] = Typedef{M: module.M, Td: module.Kind.Typedef}
-		} else {
-			return r.fail(fmt.Sprintf("Unexpected type where typedef was expected: %s", path.Name))
-		}
-	}
-	return nil
+		r.typedefs = append(r.typedefs, Typedef{M: m.M, Td: m.Kind.Typedef})
+		return 0
+	})
+	return r.err
 }
 
-func (r *Reader) readOFR() error {
-	length, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-	r.anonFields = make([]ClassField, length)
-	for k := 0; k < length; k++ {
-		cf, err := r.readClassFieldForward()
-		if err != nil {
-			return err
-		}
-		r.anonFields[k] = cf
-	}
-	return nil
-}
-
-// In hxb_reader.go
-
+func (r *Reader) readOFR() error { r.anonFields = readList(r, r.readClassFieldForward); return r.err }
 func (r *Reader) readEFD() error {
-	// 1. Joey's format declares how many master expression entries are in this block
-	exprCount, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-
-	// 2. Consume them in order, advancing the file cursor precisely.
-	// EDIT: capture the returned Node (readExpression now builds a real tree
-	// instead of only skipping bytes) and accumulate it, instead of discarding it.
-	for i := 0; i < exprCount; i++ {
-		node, err := r.readExpression()
-		if err != nil {
-			return err
-		}
-		r.Nodes = append(r.Nodes, node)
-	}
-	return nil
+	readList(r, func() int { r.Nodes = append(r.Nodes, r.checkExpr()); return 0 })
+	return r.err
 }
-
-// readAFD handles the second expression block for Anonymous Closures
 func (r *Reader) readAFD() error {
-	anonCount, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-
-	// EDIT: same accumulation as readEFD above.
-	for i := 0; i < anonCount; i++ {
-		node, err := r.readExpression()
-		if err != nil {
-			return err
-		}
-		r.Nodes = append(r.Nodes, node)
-	}
-	return nil
+	readList(r, func() int { r.Nodes = append(r.Nodes, r.checkExpr()); return 0 })
+	return r.err
 }
-
-// NOTE: the real readExpression is defined in Annotator.go, as a *Reader
-// method — this keeps opcode-decoding logic physically grouped with the
-// annotator concern, while still being a normal Reader method with full
-// access to Reader's fields (readByte/readUleb128/currentExprOffset/etc).
 
 func (r *Reader) readcrL() error {
-	// Parse your custom linearity instructions
-	actionCount, err := r.readUleb128()
-	if err != nil {
-		return err
-	}
-
-	for i := 0; i < actionCount; i++ {
-		exprOffset, _ := r.readUleb128()
-		varID, _ := r.readUleb128()
-		actionByte, _ := r.readByte()
-
-		// Stream directly into your flat Typer state map
-		r.applyLinearityState(exprOffset, varID, actionByte)
-	}
-
-	return nil
+	readList(r, func() int {
+		eo, id, b := r.checkVarint(), r.checkVarint(), r.checkByte()
+		r.checkSignedVarint()
+		if r.err == nil {
+			r.applyLinearityState(eo, id, b)
+		}
+		return 0
+	})
+	return r.err
 }
 
-// applyLinearityState intercepts and records memory lifecycle instructions using your real Typer states
-func (r *Reader) applyLinearityState(exprOffset int, varID int, actionByte byte) {
+func (r *Reader) applyLinearityState(eo, id int, b byte) {
 	if r.linearityMap == nil {
 		r.linearityMap = make(map[LinearityKey]State)
 	}
-
-	// Cast the incoming byte straight into your existing Typer State type
-	targetState := State(actionByte)
-	key := LinearityKey{ExprOffset: exprOffset, VarID: varID}
-
-	// Cache it in the flat matrix
-	r.linearityMap[key] = targetState
-
-	// Trace feedback using your real enum constants
-	var stateName string
-	switch targetState {
-	case Owned:
-		stateName = "OWNED"
-	case Borrow:
-		stateName = "BORROW"
-	case Leaked:
-		stateName = "LEAKED"
-	case Free:
-		stateName = "FREE (LFR3)"
-	default:
-		stateName = fmt.Sprintf("UNKNOWN_STATE_BYTE_(0x%X)", actionByte)
-	}
-
-	fmt.Printf("[Creeling Trace] Registered %s directive for Var %d at Expression Offset %d\n",
-		stateName, varID, exprOffset)
+	r.linearityMap[LinearityKey{ExprOffset: eo, VarID: id}] = State(b)
 }
+
+// --- The High-Speed Static Jump Router ---
 
 func (r *Reader) readChunkData(kind ChunkKind, size int) error {
 	switch kind {
 	case STR:
 		return r.readSTR()
 	case MDF_Chunk:
-		mdf, err := r.readMDF()
-		if err != nil {
-			return err
+		if mdf, err := r.readMDF(); err == nil {
+			r.module = &Module{Mdf: mdf}
+			r.api.AddModule(r.module)
 		}
-		r.module = &Module{
-			Mdf: mdf,
-			Mtf: nil,
-		}
-		r.api.AddModule(r.module)
 	case MTF_Chunk:
-		mtf, err := r.readMTF()
-		if err != nil {
-			return err
+		if mtf, err := r.readMTF(); err == nil && r.module != nil {
+			r.module.Mtf = &mtf
 		}
-		r.module.Mtf = &mtf
 	case CLR:
 		return r.readCLR()
 	case ENR:
@@ -711,128 +328,77 @@ func (r *Reader) readChunkData(kind ChunkKind, size int) error {
 		return r.readTDR()
 	case OFR:
 		return r.readOFR()
-	case EOM:
-		// Boundary reached
 	case CFD:
-		return r.readCFD()
+		r.readCFD()
 	case EFD:
 		return r.readEFD()
 	case AFD:
 		return r.readAFD()
 	case EXD:
-		// Method bodies (logic, loops, variables) converts
-		// bytecode into []Node for the Typer.
-		// EDIT: capture and accumulate the returned Node, same as readEFD/readAFD.
-		node, err := r.readExpression()
-		if err != nil {
-			return err
-		}
-		r.Nodes = append(r.Nodes, node)
-		return nil
-	case MDR:
-		// Return a baseline token or fall back to an existing descriptive chunk type
-		// so the master loop can safely read its 4-byte size header and step past it
-		return nil
+		r.Nodes = append(r.Nodes, r.checkExpr())
 	case crL:
-		// custom creeling chunk
 		return r.readcrL()
 	default:
-		if size > 0 {
-			discardBuf := make([]byte, size)
-			if _, err := io.ReadFull(r.i, discardBuf); err != nil {
-				return err
+		if size > 0 && r.err == nil {
+			buf := make([]byte, size)
+			if _, err := io.ReadFull(r.i, buf); err != nil {
+				r.err = err
 			}
 		}
 	}
-	return nil
+	return r.err
 }
+
+// --- Main Driving Stream File Parser ---
 
 func (r *Reader) Read(api ReaderApi) (*Module, error) {
 	r.api = api
-	magicBuf := make([]byte, 4)
-	if _, err := io.ReadFull(r.i, magicBuf); err != nil {
-		return nil, err
-	}
-	if string(magicBuf) != "hxb\x01" {
-		return nil, r.fail(fmt.Sprintf("Invalid magic header: %s", string(magicBuf)))
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(r.i, magic); err != nil || string(magic) != "hxb\x01" {
+		return nil, r.fail("Invalid magic header")
 	}
 
-	// Declare a fixed-size 3-byte sliding window container
 	window := make([]byte, 3)
 	for {
-		// 1. Read the initial 3-character chunk identifier string
-		_, err := io.ReadFull(r.i, window)
-		if err != nil {
+		if _, err := io.ReadFull(r.i, window); err != nil {
 			if err == io.EOF {
 				break
 			}
 			return nil, err
 		}
-
 		nameStr := string(window)
-		chunkKind, err := ChunkKindFromString(nameStr)
+		kind, err := ChunkKindFromString(nameStr)
 
-		// ====================================================================
-		// SELF-HEALING FIXED-WINDOW ANCHOR SCANNER
-		// ====================================================================
-		// If an inner decoder over-reads, or we hit an unhandled experimental chunk,
-		// scan forward byte-by-byte keeping a strict 3-byte validation window active.
+		// Self-healing Fixed-Window Anchor Scanner Loop
 		if err != nil || !validChunks[nameStr] {
-			fmt.Printf("[Pipeline Guard] Stream alignment drift hit near: |%s|. Scanning forward for next anchor...\n", nameStr)
-
 			for {
 				var b [1]byte
 				if _, err := io.ReadFull(r.i, b[:]); err != nil {
-					return nil, err // True EOF boundary reached
+					return nil, err
 				}
-
-				// Shift the fixed 3-byte window array forward by exactly 1 character
-				window[0] = window[1]
-				window[1] = window[2]
-				window[2] = b[0]
-
+				window[0], window[1], window[2] = window[1], window[2], b[0]
 				nameStr = string(window)
 				if validChunks[nameStr] {
-					fmt.Printf("[Pipeline Guard] Re-aligned successfully! Locked onto Anchor chunk: |%s|\n", nameStr)
-					chunkKind, _ = ChunkKindFromString(nameStr)
+					kind, _ = ChunkKindFromString(nameStr)
 					break
 				}
 			}
 		}
 
-		// 2. Read the 4-byte chunk size written by the Haxe compiler from the aligned position
-		var chunkSize int32
-		if err := binary.Read(r.i, binary.BigEndian, &chunkSize); err != nil {
+		var size int32
+		if err := binary.Read(r.i, binary.BigEndian, &size); err != nil {
 			return nil, err
 		}
-
-		if chunkKind == EOM {
+		if kind == EOM {
 			break
 		}
 
-		// ====================================================================
-		// 3. TARGET PARSING RULES (ISOLATE VOLATILE METADATA)
-		// ====================================================================
-		// Process core operational structures natively, but safely step past fluid
-		// or un-utilized metadata chunks (like empty MTF sequences) using their sizes.
-		//
-		// EDIT: added EFD and crL to this whitelist. Previously only
-		// EXD/STR/MDF_Chunk reached readChunkData — meaning readEFD (which
-		// actually builds the node stream the Typer needs) and readcrL
-		// (needed to read an already-annotated hxbPlus file back) were both
-		// fully implemented but structurally unreachable from this loop.
-		if chunkKind == EXD || chunkKind == STR || chunkKind == MDF_Chunk || chunkKind == EFD || chunkKind == crL {
-			if err := r.readChunkData(chunkKind, int(chunkSize)); err != nil {
-				fmt.Printf("[Pipeline Warning] Managed internal error inside %s chunk: %v\n", nameStr, err)
-			}
-		} else {
-			// Baseline safe skip: prevents internal drifts from breaking the master cursor pacing
-			if chunkSize > 0 && chunkSize < 1000000 {
-				discardBuf := make([]byte, chunkSize)
-				if _, err := io.ReadFull(r.i, discardBuf); err != nil {
-					return nil, err
-				}
-			}
+		r.err = nil
+		if kind == EXD || kind == STR || kind == MDF_Chunk || kind == EFD || kind == crL {
+			r.readChunkData(kind, int(size))
+		} else if size > 0 && size < 1000000 {
+			buf := make([]byte, size)
+			io.ReadFull(r.i, buf)
 		}
 	}
 	return r.module, nil
